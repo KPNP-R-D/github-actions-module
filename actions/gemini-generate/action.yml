@@ -1,0 +1,93 @@
+name: "Gemini Generate"
+description: "Call Gemini generateContent and return text output"
+
+inputs:
+  api_key:
+    description: "Gemini API Key (pass from GitHub Secrets)"
+    required: true
+  model:
+    description: "Model id (ex: gemini-2.5-flash)"
+    required: true
+  content:
+    description: "Final prompt content"
+    required: true
+  temperature:
+    required: false
+    default: "0.1"
+  max_output_tokens:
+    required: false
+    default: "2048"
+  system_instruction:
+    required: false
+    default: ""
+
+outputs:
+  text:
+    description: "Generated text"
+    value: ${{ steps.call.outputs.text }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: call
+      shell: bash
+      env:
+        GEMINI_API_KEY: ${{ inputs.api_key }}
+        MODEL: ${{ inputs.model }}
+        CONTENT: ${{ inputs.content }}
+        TEMPERATURE: ${{ inputs.temperature }}
+        MAX_OUTPUT_TOKENS: ${{ inputs.max_output_tokens }}
+        SYSTEM_INSTRUCTION: ${{ inputs.system_instruction }}
+      run: |
+        set -euo pipefail
+
+        if [ -n "${SYSTEM_INSTRUCTION}" ]; then
+          BODY="$(jq -n \
+            --arg content "$CONTENT" \
+            --arg sys "$SYSTEM_INSTRUCTION" \
+            --argjson temp "${TEMPERATURE}" \
+            --argjson maxTok "${MAX_OUTPUT_TOKENS}" \
+            '{
+              systemInstruction: { parts: [ { text: $sys } ] },
+              contents: [ { role: "user", parts: [ { text: $content } ] } ],
+              generationConfig: {
+                temperature: $temp,
+                maxOutputTokens: $maxTok
+              }
+            }')"
+        else
+          BODY="$(jq -n \
+            --arg content "$CONTENT" \
+            --argjson temp "${TEMPERATURE}" \
+            --argjson maxTok "${MAX_OUTPUT_TOKENS}" \
+            '{
+              contents: [ { role: "user", parts: [ { text: $content } ] } ],
+              generationConfig: {
+                temperature: $temp,
+                maxOutputTokens: $maxTok
+              }
+            }')"
+        fi
+
+        RESP="$(curl -sS -X POST "https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent" \
+          -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+          -H "Content-Type: application/json" \
+          -d "${BODY}")"
+
+        if echo "$RESP" | jq -e '.error? != null' >/dev/null; then
+          echo "::error::Gemini API error: $(echo "$RESP" | jq -c '.error')"
+          exit 1
+        fi
+
+        TEXT="$(echo "$RESP" | jq -r '.candidates[0].content.parts[0].text // empty')"
+        if [ -z "$TEXT" ]; then
+          echo "::error::Gemini returned empty text. Raw response: $RESP"
+          exit 1
+        fi
+        
+        DELIM="__EOF_$(date +%s%N)__"
+        {
+          echo "text<<$DELIM"
+          echo "$TEXT"
+          echo "$DELIM"
+        } >> "$GITHUB_OUTPUT"
