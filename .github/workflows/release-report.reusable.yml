@@ -1,0 +1,194 @@
+name: Release · Report (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      # 1) manifest dir
+      manifest_dir:
+        type: string
+        required: false
+        default: releases
+
+      # 2) services selection (CSV: "admin,champs")
+      selected_services:
+        type: string
+        required: true
+
+      release_key:
+        type: string
+        required: false
+        default: ""
+      result:
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    env:
+      MANIFEST_DIR: ${{ inputs.manifest_dir }}
+      RELEASE_KEY: ${{ inputs.release_key }}
+      RESULT: ${{ inputs.result }}
+      SELECTED_SERVICES: ${{ inputs.selected_services }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install python deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
+
+      - name: Update manifest (batch)
+        id: update_manifest
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, glob
+          from datetime import datetime
+          import yaml
+
+          MANIFEST_DIR = os.environ.get("MANIFEST_DIR", "releases")
+          RELEASE_KEY = (os.environ.get("RELEASE_KEY") or "").strip()
+          RESULT = (os.environ.get("RESULT") or "").strip().upper()
+          SELECTED_SERVICES = (os.environ.get("SELECTED_SERVICES") or "").strip()
+
+          ALLOWED = {"DEPLOYED","SKIPPED","FAILED"}
+          if RESULT not in ALLOWED:
+            raise SystemExit(f"invalid result: {RESULT}")
+
+          def parse_csv(s: str):
+            # "admin, champs" -> ["admin","champs"]
+            items = [x.strip() for x in (s or "").split(",")]
+            items = [x for x in items if x]
+            # 중복 제거(순서 유지)
+            seen = set()
+            out = []
+            for x in items:
+              if x not in seen:
+                seen.add(x)
+                out.append(x)
+            return out
+
+          selected = parse_csv(SELECTED_SERVICES)
+          if not selected:
+            raise SystemExit("no services selected (selected_services is empty)")
+
+          def parse_dt(s):
+            if not s:
+              return None
+            try:
+              return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+              return None
+
+          def load_yaml(path):
+            with open(path, "r", encoding="utf-8") as f:
+              return yaml.safe_load(f) or {}
+
+          def dump_yaml(path, data):
+            with open(path, "w", encoding="utf-8") as f:
+              yaml.safe_dump(
+                data, f,
+                allow_unicode=True,
+                sort_keys=False,
+                default_flow_style=False
+              )
+
+          files = sorted(
+            glob.glob(os.path.join(MANIFEST_DIR, "**", "*.yml"), recursive=True) +
+            glob.glob(os.path.join(MANIFEST_DIR, "**", "*.yaml"), recursive=True)
+          )
+          if not files:
+            raise SystemExit(f"no manifest files found under: {MANIFEST_DIR}")
+
+          candidates = []
+          for p in files:
+            m = load_yaml(p)
+            rk = str(m.get("releaseKey") or "").strip()
+            st = str(m.get("status") or "").strip().upper()
+            created_at = parse_dt(((m.get("meta") or {}).get("createdAt") if isinstance(m.get("meta"), dict) else None))
+            candidates.append((p, m, rk, st, created_at))
+
+          # target manifest resolve
+          target = None
+          if RELEASE_KEY:
+            for p, m, rk, st, created_at in candidates:
+              if rk == RELEASE_KEY:
+                target = (p, m)
+                break
+            if not target:
+              raise SystemExit(f"releaseKey not found: {RELEASE_KEY}")
+          else:
+            drafts = [(p, m, rk, created_at) for (p, m, rk, st, created_at) in candidates if st == "DRAFT"]
+            if not drafts:
+              raise SystemExit("no DRAFT manifests found (release_key를 지정해줘)")
+            drafts.sort(key=lambda x: (x[3] is not None, x[3] or datetime.min, x[2]), reverse=True)
+            p, m, rk, created_at = drafts[0]
+            target = (p, m)
+
+          path, manifest = target
+          status = str(manifest.get("status") or "").strip().upper()
+          if status != "DRAFT":
+            raise SystemExit(f"manifest is not DRAFT: status={status}, file={path}")
+
+          services = manifest.get("services") or {}
+          if not isinstance(services, dict):
+            raise SystemExit("invalid manifest: services must be a map/object")
+
+          # manifest 기준으로 inputKey -> 서비스명 역인덱스
+          idx = {}
+          for svc_name, svc in services.items():
+            if isinstance(svc, dict):
+              ik = str(svc.get("inputKey") or "").strip()
+              if ik:
+                idx[ik] = svc_name
+
+          missing = [k for k in selected if k not in idx]
+          if missing:
+            raise SystemExit(f"selected services not found in manifest (by inputKey): {missing}")
+
+          # 일괄 반영
+          for k in selected:
+            svc_name = idx[k]
+            services[svc_name]["result"] = RESULT
+
+          manifest["services"] = services
+          dump_yaml(path, manifest)
+
+          rk = str(manifest.get("releaseKey") or "").strip()
+          print(f"UPDATED: {path}")
+          print(f"releaseKey={rk}, result={RESULT}, services={selected}")
+
+          out_path = os.environ["GITHUB_OUTPUT"]
+          with open(out_path, "a", encoding="utf-8") as f:
+            f.write(f"rk={rk}\n")
+          PY
+
+      - name: Commit & push
+        shell: bash
+        env:
+          key: ${{ steps.update_manifest.outputs.rk }}
+        run: |
+          set -e
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          if git status --porcelain | grep -q .; then
+            git add -A
+            git commit -m "chore(release): update release report [RN-BOT][RN-REPORT] (${key})"
+            git push
+          else
+            echo "No changes to commit."
+          fi

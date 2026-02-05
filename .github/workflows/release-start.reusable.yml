@@ -1,0 +1,1220 @@
+name: Release · Start (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      catalog_path:
+        type: string
+        required: true
+        description: "서비스 카탈로그 JSON 파일 경로 (e.g. .github/release/service-catalog.json)"
+      prompts_dir:
+        type: string
+        required: true
+        description: "프롬프트 루트 디렉토리 (e.g. prompts)"
+      manifest_dir:
+        type: string
+        required: false
+        default: releases
+        description: "릴리즈 manifest 폴더 (e.g. releases)"
+
+      # =========================
+      # Runtime (caller -> reusable)
+      # =========================
+      inputs_json:
+        type: string
+        required: true
+        description: "toJson(inputs) 결과"
+      previous_tags:
+        type: string
+        required: false
+        default: ""
+      release_key:
+        type: string
+        required: false
+        default: ""
+      note:
+        type: string
+        required: false
+        default: ""
+
+      # =========================
+      # Notion options
+      # =========================
+      notion_category:
+        type: string
+        required: true
+        description: "Notion '구분' select 값"
+
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+      NOTION_TOKEN:
+        required: true
+      NOTION_DB_ID:
+        required: true
+      NOTION_DS_NAME:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 태그/히스토리 필요
+
+      - name: Install python deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
+
+      - name: Resolve releaseKey
+        id: key
+        run: |
+          if [ -n "${{ inputs.release_key }}" ]; then
+            echo "key=${{ inputs.release_key }}" >> $GITHUB_OUTPUT
+          else
+            date=$(date +%F)
+            seq=$(printf "%03d" ${{ github.run_number }})
+            echo "key=${date}-${seq}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create manifest (paths + shared + previousTag candidates)
+        env:
+          KEY: ${{ steps.key.outputs.key }}
+          NOTE: ${{ inputs.note }}
+          PREVIOUS_TAGS: ${{ inputs.previous_tags }}
+          ACTOR: ${{ github.actor }}
+
+          INPUTS_JSON: ${{ inputs.inputs_json }}
+          CATALOG_PATH: ${{ inputs.catalog_path }}
+          MANIFEST_DIR: ${{ inputs.manifest_dir }}
+        run: |
+          python - <<'PY'
+          import os, subprocess, yaml, json
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          KEY = os.environ["KEY"]
+          NOTE = (os.environ.get("NOTE") or "").strip()
+          PREVIOUS_TAGS_RAW = (os.environ.get("PREVIOUS_TAGS") or "").strip()
+          ACTOR = os.environ.get("ACTOR", "unknown")
+
+          MANIFEST_DIR = (os.environ.get("MANIFEST_DIR") or "releases").strip().strip("/")
+
+          inputs = json.loads(os.environ["INPUTS_JSON"])
+          services_cfg = json.loads(Path(os.environ["CATALOG_PATH"]).read_text(encoding="utf-8"))
+
+          def sh(cmd: str) -> str:
+            return subprocess.check_output(cmd, shell=True, text=True).strip()
+
+          def tag_exists(tag: str) -> bool:
+            try:
+              subprocess.check_output(f"git rev-parse -q --verify refs/tags/{tag}", shell=True, text=True)
+              return True
+            except subprocess.CalledProcessError:
+              return False
+
+          def commit_exists(rev: str) -> bool:
+            try:
+              subprocess.check_output(f'git rev-parse -q --verify "{rev}^{{commit}}"', shell=True, text=True)
+              return True
+            except subprocess.CalledProcessError:
+              return False
+
+          def normalize_commit(rev: str) -> str:
+            return sh(f'git rev-parse "{rev}^{{commit}}"')
+
+          def list_top_tags(prefix: str, n: int = 20):
+            cmd = f'git tag --list "{prefix}/v*" --sort=-version:refname | head -n {n}'
+            try:
+              out = sh(cmd)
+            except subprocess.CalledProcessError:
+              out = ""
+            return [x.strip() for x in out.splitlines() if x.strip()] if out else []
+
+          def parse_previous_tags(raw: str, services_cfg: dict):
+            if not raw:
+              return {}
+            inputkey_to_service = { cfg["inputKey"]: svc for svc, cfg in services_cfg.items() }
+            m = {}
+            for it in [x.strip() for x in raw.split(",") if x.strip()]:
+              if "=" not in it:
+                raise SystemExit(f"Invalid previous_tags item (missing '='): {it}")
+              k, v = it.split("=", 1)
+              k, v = k.strip(), v.strip()
+              if not k or not v:
+                raise SystemExit(f"Invalid previous_tags item (empty key/value): {it}")
+
+              if k in services_cfg:
+                svc_key = k
+              elif k in inputkey_to_service:
+                svc_key = inputkey_to_service[k]
+              else:
+                raise SystemExit(f"Unknown service key in previous_tags: {k}")
+
+              if svc_key in m:
+                raise SystemExit(f"Duplicate previous_tags key: {svc_key}")
+              m[svc_key] = v
+            return m
+
+          included = []
+          for svc, cfg in services_cfg.items():
+            v = inputs.get(cfg["inputKey"])
+            if v is True or (isinstance(v, str) and v.lower() == "true"):
+              included.append(svc)
+
+          if not included:
+            raise SystemExit("No services selected (checkboxes).")
+
+          prev_overrides = parse_previous_tags(PREVIOUS_TAGS_RAW, services_cfg)
+          extra_keys = [k for k in prev_overrides.keys() if k not in included]
+          if extra_keys:
+            raise SystemExit(f"previous_tags contains services not selected: {extra_keys}")
+
+          shared_paths_set = set()
+          for svc in included:
+            for p in (services_cfg[svc].get("sharedPaths") or []):
+              if p and isinstance(p, str):
+                shared_paths_set.add(p.strip())
+          shared_paths = sorted([p for p in shared_paths_set if p])
+
+          now = datetime.now(timezone.utc).astimezone().isoformat()
+          head_sha = sh("git rev-parse HEAD")
+
+          manifest_services = {}
+          summary_lines = []
+
+          for svc in included:
+            cfg = services_cfg[svc]
+            prefix = cfg["tagPrefix"]
+            paths = cfg["servicePaths"]
+            override = prev_overrides.get(svc)
+
+            candidates = list_top_tags(prefix, 20)
+
+            if override:
+              if override.startswith(prefix + "/"):
+                if not tag_exists(override):
+                  raise SystemExit(f"{svc}: override tag '{override}' does not exist")
+                previous_tag = override
+              else:
+                if not commit_exists(override):
+                  raise SystemExit(f"{svc}: override commit '{override}' does not exist or is not a commit")
+                previous_tag = normalize_commit(override)
+            else:
+              previous_tag = None
+
+            manifest_services[svc] = {
+              "paths": paths,
+              "inputKey": cfg["inputKey"],
+              "tagPrefix": prefix,
+              "result": None,
+              "deployedTag": None,
+              "deployedSha": None,
+              "previousTag": previous_tag,
+              "previousTagCandidates": candidates,
+            }
+
+            summary_lines.append(f"- {svc}: previousTag={previous_tag}, candidates={len(candidates)}, paths={paths}")
+
+          data = {
+            "version": 1,
+            "releaseKey": KEY,
+            "environment": "prod",
+            "status": "DRAFT",
+            "services": manifest_services,
+            "shared": {
+              "paths": shared_paths,
+              "policy": {"mode": "separate_section_only"}
+            },
+            "meta": {
+              "createdBy": ACTOR,
+              "createdAt": now,
+              "note": NOTE,
+              "includedServices": included,
+              "notionPageId": None,
+              "baselineHeadSha": head_sha,
+            }
+          }
+
+          os.makedirs(MANIFEST_DIR, exist_ok=True)
+          manifest_path = f"{MANIFEST_DIR}/{KEY}.yml"
+          with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as s:
+            s.write(f"## release-start: {KEY}\n\n")
+            s.write("### included services\n")
+            s.write("\n".join([f"- {x}" for x in included]) + "\n\n")
+            s.write("### shared (merged from selected services)\n")
+            s.write(f"- paths: {shared_paths}\n")
+            s.write(f"- mode: separate_section_only\n\n")
+            s.write("### previousTag resolution\n")
+            s.write("\n".join(summary_lines) + "\n\n")
+
+          print(f"manifest={manifest_path}")
+          PY
+
+      - name: Build draft (commit logs)
+        id: build_draft
+        env:
+          KEY: ${{ steps.key.outputs.key }}
+          MANIFEST_DIR: ${{ inputs.manifest_dir }}
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force
+
+          key="$KEY"
+          manifest_dir="$MANIFEST_DIR"
+          export MANIFEST_PATH="${manifest_dir}/${key}.yml"
+
+          draft=$(python - <<'PY'
+          import os, yaml, subprocess, json, re, html
+          from datetime import datetime
+
+          def sh(cmd: str) -> str:
+            return subprocess.check_output(cmd, shell=True, text=True).strip()
+
+          # record sep: \x1e, field sep: \x1f
+          GIT_PRETTY = r'%h%x1f%B%x1e'
+
+          def git_epoch_of_ref(ref: str):
+            if not ref:
+              return None
+            try:
+              out = sh(f'git show -s --format=%ct "{ref}"')
+              return int(out)
+            except Exception:
+              return None
+
+          def oldest_commit_in_paths(paths, baseline, n=80):
+            """
+            baseline 기준으로 paths에서 -n n 로그를 뽑고,
+            그 중 가장 오래된(출력의 마지막) 커밋 (ts, sha) 반환
+            """
+            if not paths:
+              return None
+
+            cmd = (
+              f'git log -n {n} --format=%ct%x1f%H '
+              f'"{baseline}" -- ' + " ".join([f'"{p}"' for p in paths])
+            )
+            try:
+              raw = sh(cmd)
+            except Exception:
+              return None
+
+            if not raw.strip():
+              return None
+
+            last = raw.strip().splitlines()[-1]  # 최신->과거, 마지막이 oldest
+            try:
+              ts_str, sha = last.split("\x1f", 1)
+              return (int(ts_str), sha.strip())
+            except Exception:
+              return None
+
+          def _normalize_body_line(line: str) -> str:
+            t = line.strip()
+
+            for prefix in ("- ", "* ", "• "):
+              if t.startswith(prefix):
+                return t[len(prefix):].lstrip()
+
+            m = re.match(r"^\d+[.)]\s+", t)
+            if m:
+              return t[m.end():].lstrip()
+
+            return t
+
+          def git_log_to_md(cmd: str) -> str:
+            raw = sh(cmd)
+            if not raw.strip():
+              return ""
+
+            chunks = []
+            for rec in raw.split("\x1e"):
+              rec = rec.strip("\n")
+              if not rec:
+                continue
+
+              parts = rec.split("\x1f", 1)
+              if len(parts) != 2:
+                continue
+
+              h = (parts[0] or "").strip()
+              msg = parts[1] or ""
+              lines = msg.splitlines()
+              if not lines:
+                continue
+
+              subject = lines[0].strip()
+
+              # ✅ 릴리즈 노트 워크플로 자동 커밋 제외 (release-start/report/finalize 모두 커버)
+              if "[RN-BOT]" in subject or "[RN-BOT]" in msg:
+                continue
+
+              rest = lines[1:]
+              while rest and not rest[0].strip():
+                rest = rest[1:]
+
+              out = [f"- {subject} ({h})"]
+              for line in rest:
+                if not line.strip():
+                  continue
+                out.append(f"  - {_normalize_body_line(line)}")
+
+              chunks.append("\n".join(out))
+
+            return "\n".join(chunks)
+
+          key = os.environ["KEY"]
+          manifest_path = os.environ["MANIFEST_PATH"]
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          with open(manifest_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+
+          baseline = data["meta"]["baselineHeadSha"]
+          mode = data.get("shared", {}).get("policy", {}).get("mode")
+          shared_paths = data.get("shared", {}).get("paths", [])
+
+          included = data.get("meta", {}).get("includedServices", [])
+          services = data.get("services", {})
+
+          # =========================================
+          # ✅ global_prev 우선순위
+          # 1) included 서비스들의 previousTag 중 "가장 오래된" tag
+          # 2) (모두 없으면) 서비스별 git log -n 80 결과 중 "가장 오래된" 커밋 SHA
+          # =========================================
+          prev_candidates = []
+          for svc in included:
+            cfg = services.get(svc, {}) or {}
+            prev = cfg.get("previousTag")
+            ts = git_epoch_of_ref(prev) if prev else None
+            if prev and ts is not None:
+              prev_candidates.append((ts, prev))
+
+          if prev_candidates:
+            global_prev = min(prev_candidates, key=lambda x: x[0])[1]
+          else:
+            fallback = []
+            for svc in included:
+              cfg = services.get(svc, {}) or {}
+              paths = cfg.get("paths", [])
+              r = oldest_commit_in_paths(paths, baseline, n=80)
+              if r:
+                fallback.append(r)  # (ts, sha)
+
+            global_prev = min(fallback, key=lambda x: x[0])[1] if fallback else None
+
+          out = []
+          debug = {
+            "key": key,
+            "manifest_path": manifest_path,
+            "baselineHeadSha": baseline,
+            "shared.policy.mode": mode,
+            "shared.paths": shared_paths,
+            "meta.includedServices": included,
+            "global_prev": global_prev,
+            "services_debug": [],
+            "shared_logs_cmd": None,
+            "shared_logs": None,
+          }
+
+          # =========================================
+          # Shared logs
+          # =========================================
+          shared_logs = ""
+          if shared_paths:
+            # ✅ shared 범위: global_prev 있으면 global_prev..baseline, 없으면 baseline만
+            if global_prev:
+              rev = f'"{global_prev}..{baseline}"'
+            else:
+              rev = f'"{baseline}"'
+
+            cmd = (
+              f'git log -n 80 --pretty=format:"{GIT_PRETTY}" '
+              f'{rev} -- ' + " ".join([f'"{p}"' for p in shared_paths])
+            )
+            debug["shared_logs_cmd"] = cmd
+            try:
+              shared_logs = git_log_to_md(cmd)
+            except Exception as e:
+              shared_logs = ""
+              debug["shared_logs_error"] = str(e)
+            debug["shared_logs"] = shared_logs
+
+          if shared_paths and mode == "separate_section_only":
+            out.append("## Shared")
+            out.append("### Draft changes")
+            out.append(shared_logs if shared_logs else "- (no commits)")
+            out.append("")
+
+          # =========================================
+          # Services logs
+          # =========================================
+          for svc in included:
+            cfg = services.get(svc, {}) or {}
+            paths = cfg.get("paths", [])
+            prev = cfg.get("previousTag")
+
+            out.append(f"## {svc}")
+            out.append(f"- previousTag: {prev}")
+            out.append(f"- paths: {paths}")
+
+            if prev:
+              cmd = (
+                f'git log -n 80 --pretty=format:"{GIT_PRETTY}" '
+                f'"{prev}..{baseline}" -- ' + " ".join([f'"{p}"' for p in paths])
+              )
+            else:
+              cmd = (
+                f'git log -n 80 --pretty=format:"{GIT_PRETTY}" '
+                f'"{baseline}" -- ' + " ".join([f'"{p}"' for p in paths])
+              )
+
+            logs = ""
+            err = None
+            try:
+              logs = git_log_to_md(cmd)
+            except Exception as e:
+              logs = ""
+              err = str(e)
+
+            out.append("### Draft changes")
+            out.append(logs if logs else "- (no commits)")
+
+            if shared_paths and mode == "attach_to_selected_services":
+              out.append("### Shared changes")
+              out.append(shared_logs if shared_logs else "- (no commits)")
+
+            out.append("")
+
+            debug["services_debug"].append({
+              "service": svc,
+              "previousTag": prev,
+              "paths": paths,
+              "git_log_cmd": cmd,
+              "git_log_error": err,
+              "git_log_output": logs,
+            })
+
+          text = "\n".join(out)
+
+          # ===== Debug Summary (append) =====
+          if summary_path:
+            marker = f"[debug][create-notion-page][draft-logs] {key} {datetime.utcnow().isoformat()}Z"
+            with open(summary_path, "a", encoding="utf-8") as summary_fp:
+              summary_fp.write("\n\n---\n")
+              summary_fp.write(f"## {marker}\n")
+              summary_fp.write("\n### Inputs / Resolved values\n")
+              summary_fp.write("```json\n")
+              summary_fp.write(json.dumps(
+                {
+                  "key": debug["key"],
+                  "manifest_path": debug["manifest_path"],
+                  "baselineHeadSha": debug["baselineHeadSha"],
+                  "shared.policy.mode": debug["shared.policy.mode"],
+                  "shared.paths": debug["shared.paths"],
+                  "meta.includedServices": debug["meta.includedServices"],
+                  "global_prev": debug.get("global_prev"),
+                },
+                ensure_ascii=False,
+                indent=2
+              ))
+              summary_fp.write("\n```\n")
+
+              # =========================
+              # Shared logs
+              # =========================
+              summary_fp.write("\n### Shared logs (cmd + output)\n")
+              summary_fp.write("\n<details>\n")
+              summary_fp.write("<summary>logs</summary>\n\n")
+              summary_fp.write("```text\n")
+              summary_fp.write((debug.get("shared_logs_cmd") or "-") + "\n\n")
+              summary_fp.write((debug.get("shared_logs") or "- (no commits)") + "\n")
+              if debug.get("shared_logs_error"):
+                summary_fp.write("\n[error]\n" + debug["shared_logs_error"] + "\n")
+              summary_fp.write("```\n\n")
+              summary_fp.write("</details>\n")
+
+              # =========================
+              # Services logs
+              # =========================
+              summary_fp.write("\n### Services logs (cmd + output)\n")
+              for item in debug.get("services_debug", []):
+                service = item.get("service", "-")
+                previous_tag = item.get("previousTag", "-")
+                paths = item.get("paths") or []
+                paths_str = ", ".join(paths) if isinstance(paths, list) else str(paths)
+
+                summary_fp.write(f"\n#### {service}\n")
+                summary_fp.write("\n<details>\n")
+                summary_fp.write("<summary>logs</summary>\n\n")
+                summary_fp.write("```text\n")
+                summary_fp.write(f"previousTag: {previous_tag}\n")
+                summary_fp.write(f"paths: {paths_str}\n\n")
+                summary_fp.write((item.get("git_log_cmd") or "-") + "\n\n")
+                summary_fp.write((item.get("git_log_output") or "- (no commits)") + "\n")
+                if item.get("git_log_error"):
+                  summary_fp.write("\n[error]\n" + item["git_log_error"] + "\n")
+                summary_fp.write("```\n\n")
+                summary_fp.write("</details>\n")
+
+              # =========================
+              # Draft (LLM output) - SAFE HTML
+              # =========================
+              summary_fp.write("\n### Draft\n")
+              summary_fp.write("\n<details>\n")
+              summary_fp.write("<summary>logs</summary>\n\n")
+              summary_fp.write("<pre><code>")
+              summary_fp.write(html.escape(text or ""))
+              summary_fp.write("</code></pre>\n\n")
+              summary_fp.write("</details>\n")
+
+          print(text)
+          PY
+          )
+
+          {
+            echo "draft<<__DRAFT__"
+            echo "$draft"
+            echo "__DRAFT__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build Gemini content
+        id: prompt
+        shell: bash
+        env:
+          COMMITS_DRAFT: ${{ steps.build_draft.outputs.draft }}
+          PROMPTS_DIR: ${{ inputs.prompts_dir }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import os, uuid
+
+          prompts_dir = Path(os.environ["PROMPTS_DIR"])
+
+          prompt = (prompts_dir / "gemini/release-notes.system.md").read_text(encoding="utf-8")
+          input_md = (prompts_dir / "gemini/release-notes.input.md").read_text(encoding="utf-8")
+          template = (prompts_dir / "release-notes.template.md").read_text(encoding="utf-8")
+          commits = os.environ.get("COMMITS_DRAFT", "")
+
+          content = (input_md
+            .replace("{{TEMPLATE}}", template)
+            .replace("{{COMMITS}}", commits)
+          )
+
+          out_path = os.environ["GITHUB_OUTPUT"]
+
+          with open(out_path, "a", encoding="utf-8") as f:
+            delim = f"__PROMPT_{uuid.uuid4().hex}__"
+            f.write(f"prompt<<{delim}\n")
+            f.write(prompt + ("\n" if not prompt.endswith("\n") else ""))
+            f.write(f"{delim}\n")
+
+          with open(out_path, "a", encoding="utf-8") as f:
+            delim = f"__CONTENT_{uuid.uuid4().hex}__"
+            f.write(f"content<<{delim}\n")
+            f.write(content + ("\n" if not content.endswith("\n") else ""))
+            f.write(f"{delim}\n")
+          PY
+
+      - name: Gemini refine
+        id: llm
+        if: ${{ steps.prompt.outputs.content != '' }}
+        uses: 5n-project/github-actions-module/actions/gemini-generate@gemini-generate/v1
+        with:
+          api_key: ${{ secrets.GEMINI_API_KEY }}
+          model: gemini-2.5-flash
+          temperature: 0.3
+          max_output_tokens: 50000
+          system_instruction: ${{ steps.prompt.outputs.prompt }}
+          content: ${{ steps.prompt.outputs.content }}
+
+      - name: Append Gemini output to Step Summary
+        shell: bash
+        env:
+          LLM_TEXT: ${{ steps.llm.outputs.text }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          text = os.environ.get("LLM_TEXT", "")
+
+          with open(summary_path, "a", encoding="utf-8") as f:
+            f.write("## Gemini refined release notes\n\n")
+            f.write("```\n")
+            f.write(text)
+            if not text.endswith("\n"):
+              f.write("\n")
+            f.write("```\n")
+          PY
+
+      - name: Create Notion page (draft)
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
+          NOTION_DS_NAME: ${{ secrets.NOTION_DS_NAME }}
+
+          NOTION_CATEGORY: ${{ inputs.notion_category }}
+
+          KEY: ${{ steps.key.outputs.key }}
+          DRAFT: ${{ steps.build_draft.outputs.draft }}
+          RELEASE_NOTES: ${{ steps.llm.outputs.text }}
+
+          MANIFEST_DIR: ${{ inputs.manifest_dir }}
+        run: |
+          set -euo pipefail
+
+          key="$KEY"
+          manifest_dir="$MANIFEST_DIR"
+          manifest="${manifest_dir}/${key}.yml"
+          export MANIFEST_PATH="$manifest"
+
+          # =========================================
+          # 0) DB -> data_source_id resolve
+          # =========================================
+          dbres=$(curl -sS -X GET "https://api.notion.com/v1/databases/$NOTION_DB_ID" \
+            -H "Authorization: Bearer $NOTION_TOKEN" \
+            -H "Notion-Version: 2025-09-03" \
+            -H "Content-Type: application/json")
+
+          dataSourceId=$(echo "$dbres" | jq -r --arg name "${NOTION_DS_NAME:-}" '
+            if ($name | length) > 0 then
+              ([.data_sources[]? | select(.name == $name) | .id] | first) // empty
+            else
+              .data_sources[0].id // empty
+            end
+          ')
+
+          if [ -z "$dataSourceId" ]; then
+            echo "Failed to resolve data_source_id."
+            echo "NOTION_DS_NAME='${NOTION_DS_NAME:-}'"
+            echo "Available data_sources:"
+            echo "$dbres" | jq -r '.data_sources[]? | "- \(.name) : \(.id)"' || true
+            echo "Raw response: $dbres"
+            exit 1
+          fi
+
+          echo "Resolved data_source_id=$dataSourceId"
+
+          # =========================================
+          # 배포 버전(=next tag) rich_text 생성
+          # =========================================
+          versions_rich=$(python - <<'PY'
+          import os, json, subprocess, yaml
+
+          manifest = os.environ["MANIFEST_PATH"]
+
+          def sh(cmd: str) -> str:
+            return subprocess.check_output(cmd, shell=True, text=True).strip()
+
+          def list_tags_asc(prefix: str):
+            out = sh(f'git tag --list "{prefix}/v*" --sort=version:refname') if prefix else ""
+            return [x.strip() for x in out.splitlines() if x.strip()] if out else []
+
+          def resolve_next_tag(prefix: str, prev):
+            if not prefix or not prev:
+              return "-"
+            tags = list_tags_asc(prefix)
+            if prev not in tags:
+              return "-"
+            i = tags.index(prev)
+            return tags[i + 1] if i + 1 < len(tags) else "-"
+
+          def rt(text, code=False):
+            return {
+              "type": "text",
+              "text": {"content": text},
+              "annotations": {
+                "bold": False,
+                "italic": False,
+                "strikethrough": False,
+                "underline": False,
+                "code": bool(code),
+                "color": "default",
+              }
+            }
+
+          with open(manifest, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+
+          included = data["meta"]["includedServices"]
+          services = data.get("services", {})
+
+          out = []
+          for idx, svc in enumerate(included):
+            cfg = services.get(svc, {})
+            input_key = cfg.get("inputKey") or svc.lower()
+            prefix = cfg.get("tagPrefix")
+            prev = cfg.get("previousTag")
+            next_tag = resolve_next_tag(prefix, prev)
+
+            out.append(rt(f"{input_key}:"))
+            out.append(rt(next_tag, code=True) if next_tag != "-" else rt("-", code=False))
+            if idx != len(included) - 1:
+              out.append(rt("\n"))
+
+          print(json.dumps(out, ensure_ascii=False))
+          PY
+          )
+
+          # =========================================
+          # Notion multi_select(Project) payload용
+          # =========================================
+          projects=$(python - <<'PY'
+          import os, yaml, json
+          manifest = os.environ["MANIFEST_PATH"]
+          with open(manifest, encoding="utf-8") as f:
+            data=yaml.safe_load(f)
+          included=data["meta"]["includedServices"]
+          print(json.dumps([{"name": x} for x in included], ensure_ascii=False))
+          PY
+          )
+
+          # =========================================
+          # 1) Create page (children 최소)
+          # =========================================
+          create_payload=$(jq -n \
+            --arg ds "$dataSourceId" \
+            --arg title "$key" \
+            --arg status "배포예정" \
+            --arg category "${NOTION_CATEGORY}" \
+            --arg date "$(date +%F)" \
+            --argjson versions "$versions_rich" \
+            --argjson projects "$projects" \
+            '{
+              parent: { data_source_id: $ds },
+              properties: {
+                "제목": { title: [{ text: { content: $title } }] },
+                "구분": { select: { name: $category } },
+                "배포 날짜": { date: { start: $date } },
+                "배포 버전": { rich_text: $versions },
+                "상태": { select: { name: $status } },
+                "프로젝트": { multi_select: $projects }
+              }
+            }')
+
+          res=$(curl -sS -X POST "https://api.notion.com/v1/pages" \
+            -H "Authorization: Bearer $NOTION_TOKEN" \
+            -H "Notion-Version: 2025-09-03" \
+            -H "Content-Type: application/json" \
+            --data "$create_payload")
+
+          pageId=$(echo "$res" | jq -r '.id')
+          if [ "$pageId" = "null" ] || [ -z "$pageId" ]; then
+            echo "Notion create failed: $res"
+            exit 1
+          fi
+
+          echo "Created pageId=$pageId"
+
+          # =========================================
+          # 2) 데이터2 -> 상단 출력(뎁스/서식 유지), 데이터1 -> toggle로 (toggle children은 별도 append)
+          #    - hr(---)는 데이터2에서 전부 제거
+          #    - hr은 "4"와 "Raw Draft" 사이에만 1개 삽입
+          # =========================================
+          python - <<'PY'
+          import os, json, re
+
+          release_notes = (os.environ.get("RELEASE_NOTES") or "").strip()
+          draft = (os.environ.get("DRAFT") or "").strip()
+
+          # ---------- Notion helpers ----------
+          def rt_plain(text: str):
+            return [{"type":"text","text":{"content": (text or "")[:2000]}}]
+
+          def heading2_plain(text: str):
+            return {"object":"block","type":"heading_2","heading_2":{"rich_text": rt_plain(text)}}
+
+          def paragraph_plain(text: str):
+            return {"object":"block","type":"paragraph","paragraph":{"rich_text": rt_plain(text)}}
+
+          def bullet_plain(text: str, children=None):
+            blk = {"object":"block","type":"bulleted_list_item","bulleted_list_item":{"rich_text": rt_plain(text)}}
+            if children:
+              blk["bulleted_list_item"]["children"] = children
+            return blk
+
+          def toggle_plain(text: str):
+            return {"object":"block","type":"toggle","toggle":{"rich_text": rt_plain(text)}}
+
+          def divider():
+            return {"object":"block","type":"divider","divider":{}}
+
+          def clean_dash_prefix(s: str) -> str:
+            t = (s or "").strip()
+            return t[2:].lstrip() if t.startswith("- ") else t
+
+          # ---------- markdown inline -> Notion rich_text ----------
+          def rich_text_from_md(s: str):
+            """
+            지원: **bold**, *italic*, `code`
+            (복잡한 중첩/링크는 생략)
+            """
+            s = s or ""
+            out = []
+            i = 0
+
+            def push(text, bold=False, italic=False, code=False):
+              if not text:
+                return
+              text = text[:2000]
+              out.append({
+                "type": "text",
+                "text": {"content": text},
+                "annotations": {
+                  "bold": bool(bold),
+                  "italic": bool(italic),
+                  "strikethrough": False,
+                  "underline": False,
+                  "code": bool(code),
+                  "color": "default",
+                }
+              })
+
+            while i < len(s):
+              # code
+              if s[i] == "`":
+                j = s.find("`", i + 1)
+                if j != -1:
+                  push(s[i+1:j], code=True)
+                  i = j + 1
+                  continue
+
+              # bold
+              if s.startswith("**", i):
+                j = s.find("**", i + 2)
+                if j != -1:
+                  push(s[i+2:j], bold=True)
+                  i = j + 2
+                  continue
+
+              # italic (single *)
+              if s[i] == "*":
+                if i + 1 < len(s) and s[i+1] == "*":
+                  pass
+                else:
+                  j = s.find("*", i + 1)
+                  if j != -1:
+                    push(s[i+1:j], italic=True)
+                    i = j + 1
+                    continue
+
+              # plain run
+              next_pos = []
+              p = s.find("`", i + 1)
+              if p != -1: next_pos.append(p)
+              p = s.find("**", i + 2)
+              if p != -1: next_pos.append(p)
+              p = s.find("*", i + 1)
+              if p != -1: next_pos.append(p)
+
+              j = min(next_pos) if next_pos else len(s)
+              push(s[i:j])
+              i = j
+
+            return out if out else [{"type":"text","text":{"content":""}}]
+
+          # ---------- Notion block builders (md rich_text) ----------
+          def heading2_md(text: str):
+            return {"object":"block","type":"heading_2","heading_2":{"rich_text": rich_text_from_md(text)}}
+
+          def heading3_md(text: str):
+            return {"object":"block","type":"heading_3","heading_3":{"rich_text": rich_text_from_md(text)}}
+
+          def paragraph_md(text: str):
+            return {"object":"block","type":"paragraph","paragraph":{"rich_text": rich_text_from_md(text)}}
+
+          def bullet_md(text: str):
+            return {"object":"block","type":"bulleted_list_item","bulleted_list_item":{"rich_text": rich_text_from_md(text)}}
+
+          def number_md(text: str):
+            return {"object":"block","type":"numbered_list_item","numbered_list_item":{"rich_text": rich_text_from_md(text)}}
+
+          # ---------- 데이터1(draft) 파싱: 기존 포맷 유지 ----------
+          section_re = re.compile(r"^##\s+(.+?)\s*$")
+          commit_re  = re.compile(r"^- .+")
+          sub_re     = re.compile(r"^\s{2,}-\s+.+")  # "  - ..."
+
+          sections_order = []
+          sections = {}
+          cur = None
+
+          lines = draft.splitlines()
+          i = 0
+          while i < len(lines):
+            line = lines[i].rstrip()
+
+            m = section_re.match(line)
+            if m:
+              cur = m.group(1)
+              if cur not in sections:
+                sections[cur] = []
+                sections_order.append(cur)
+              i += 1
+              continue
+
+            if cur is None:
+              i += 1
+              continue
+
+            if line.startswith("### "):
+              i += 1
+              continue
+            if line.startswith("- previousTag:") or line.startswith("- paths:"):
+              i += 1
+              continue
+
+            if commit_re.match(line):
+              title = clean_dash_prefix(line)
+              subs = []
+              j = i + 1
+              while j < len(lines) and sub_re.match(lines[j]):
+                subs.append(clean_dash_prefix(lines[j].strip()))
+                j += 1
+              sections[cur].append((title, subs))
+              i = j
+              continue
+
+            i += 1
+
+          draft_blocks = []
+          for sec in sections_order:
+            draft_blocks.append(heading2_plain(sec))
+            items = sections.get(sec, [])
+            if not items:
+              draft_blocks.append(paragraph_plain("(no commits)"))
+              continue
+            for title, subs in items:
+              child_blocks = [bullet_plain(s) for s in subs] if subs else None
+              draft_blocks.append(bullet_plain(title, child_blocks))
+
+          # ---------- 데이터2(markdown) -> Notion blocks (depth + bold 유지) ----------
+          md_blocks = []
+          if release_notes:
+            lines2 = release_notes.splitlines()
+
+            last_list_at = {}  # (type, level) -> block ref
+            def reset_list_state():
+              last_list_at.clear()
+
+            for raw in lines2:
+              line = raw.rstrip("\n")
+
+              if not line.strip():
+                reset_list_state()
+                continue
+
+              s = line.strip()
+
+              # ✅ hr(---)는 전부 제거 (요구사항)
+              if s == "---":
+                reset_list_state()
+                continue
+
+              # headings
+              if s.startswith("## "):
+                md_blocks.append(heading2_md(s[3:].strip()))
+                reset_list_state()
+                continue
+              if s.startswith("### "):
+                md_blocks.append(heading3_md(s[4:].strip()))
+                reset_list_state()
+                continue
+
+              # list items
+              m = re.match(r"^(\s*)([-*])\s+(.*)$", line)
+              n = re.match(r"^(\s*)(\d+)\.\s+(.*)$", line)
+              if m or n:
+                indent = len((m.group(1) if m else n.group(1)).replace("\t", "    "))
+                level = indent // 4
+
+                if m:
+                  list_type = "bullet"
+                  text = m.group(3).strip()
+                  blk = bullet_md(text)
+                else:
+                  list_type = "number"
+                  text = n.group(3).strip()
+                  blk = number_md(text)
+
+                if level <= 0:
+                  md_blocks.append(blk)
+                  last_list_at[(list_type, 0)] = blk
+                else:
+                  parent = last_list_at.get((list_type, level - 1))
+                  if parent is None:
+                    parent = last_list_at.get(("bullet", level - 1)) or last_list_at.get(("number", level - 1))
+
+                  if parent is None:
+                    md_blocks.append(blk)
+                    last_list_at[(list_type, 0)] = blk
+                  else:
+                    if parent["type"] == "bulleted_list_item":
+                      children = parent["bulleted_list_item"].setdefault("children", [])
+                    else:
+                      children = parent["numbered_list_item"].setdefault("children", [])
+                    children.append(blk)
+                    last_list_at[(list_type, level)] = blk
+                continue
+
+              md_blocks.append(paragraph_md(s))
+              reset_list_state()
+
+          # ---------- 최종 children ----------
+          children = []
+          children += (md_blocks if md_blocks else [paragraph_plain("(empty)")])
+
+          # ✅ hr은 "데이터2 끝(=4 아래)"과 "Raw Draft 토글" 사이에만 1개
+          children.append(divider())
+
+          # ✅ toggle은 껍데기만 (children <=100 제한 회피)
+          children.append(toggle_plain("Raw Draft (Data 1)"))
+
+          with open("notion_blocks.json", "w", encoding="utf-8") as f:
+            json.dump({"children": children}, f, ensure_ascii=False)
+
+          with open("notion_toggle_children.json", "w", encoding="utf-8") as f:
+            json.dump({"children": draft_blocks if draft_blocks else [paragraph_plain("(empty)")]}, f, ensure_ascii=False)
+
+          print(f"Wrote notion_blocks.json (release_blocks={len(md_blocks)}, draft_blocks={len(draft_blocks)}, total_blocks={len(children)})")
+          PY
+
+          # =========================================
+          # 3-1) page blocks append (95개씩 chunk)  ✅ -d @file로 인자 제한 회피
+          # =========================================
+          total=$(jq '.children | length' notion_blocks.json)
+          offset=0
+
+          while [ "$offset" -lt "$total" ]; do
+            jq -c --argjson o "$offset" \
+              '{children: (.children[ $o : ($o+95) ])}' \
+              notion_blocks.json > notion_chunk.json
+
+            cres=$(curl -sS -X PATCH "https://api.notion.com/v1/blocks/$pageId/children" \
+              -H "Authorization: Bearer $NOTION_TOKEN" \
+              -H "Notion-Version: 2025-09-03" \
+              -H "Content-Type: application/json" \
+              --data-binary @notion_chunk.json)
+
+            ok=$(echo "$cres" | jq -r 'if .object=="error" then "false" else "true" end')
+            if [ "$ok" != "true" ]; then
+              echo "::error::Notion append failed offset=$offset res=$cres"
+              exit 1
+            fi
+
+            offset=$((offset+95))
+          done
+
+          # =========================================
+          # 3-2) toggle block id resolve
+          # =========================================
+          toggleId=""
+          cursor=""
+
+          while : ; do
+            if [ -n "$cursor" ]; then
+              url="https://api.notion.com/v1/blocks/$pageId/children?page_size=100&start_cursor=$cursor"
+            else
+              url="https://api.notion.com/v1/blocks/$pageId/children?page_size=100"
+            fi
+
+            list=$(curl -sS -X GET "$url" \
+              -H "Authorization: Bearer $NOTION_TOKEN" \
+              -H "Notion-Version: 2025-09-03" \
+              -H "Content-Type: application/json")
+
+            toggleId=$(echo "$list" | jq -r '
+              .results[]
+              | select(.type=="toggle")
+              | select((.toggle.rich_text[0].plain_text // "") == "Raw Draft (Data 1)")
+              | .id
+            ' | head -n 1)
+
+            if [ -n "$toggleId" ] && [ "$toggleId" != "null" ]; then
+              break
+            fi
+
+            has_more=$(echo "$list" | jq -r '.has_more')
+            if [ "$has_more" != "true" ]; then
+              break
+            fi
+            cursor=$(echo "$list" | jq -r '.next_cursor')
+          done
+
+          if [ -z "$toggleId" ] || [ "$toggleId" = "null" ]; then
+            echo "::error::toggle block not found"
+            exit 1
+          fi
+
+          echo "Resolved toggleId=$toggleId"
+
+          # =========================================
+          # 3-3) toggle children append (95개씩 chunk, <=100 준수)
+          # =========================================
+          total=$(jq '.children | length' notion_toggle_children.json)
+          offset=0
+
+          while [ "$offset" -lt "$total" ]; do
+            jq -c --argjson o "$offset" \
+              '{children: (.children[ $o : ($o+95) ])}' \
+              notion_toggle_children.json > notion_toggle_chunk.json
+
+            cres=$(curl -sS -X PATCH "https://api.notion.com/v1/blocks/$toggleId/children" \
+              -H "Authorization: Bearer $NOTION_TOKEN" \
+              -H "Notion-Version: 2025-09-03" \
+              -H "Content-Type: application/json" \
+              --data-binary @notion_toggle_chunk.json)
+
+            ok=$(echo "$cres" | jq -r 'if .object=="error" then "false" else "true" end')
+            if [ "$ok" != "true" ]; then
+              echo "::error::Notion toggle append failed offset=$offset res=$cres"
+              exit 1
+            fi
+
+            offset=$((offset+95))
+          done
+
+          # =========================================
+          # 4) manifest에 notionPageId 저장
+          # =========================================
+          python - <<'PY'
+          import os, yaml
+
+          p = os.environ["MANIFEST_PATH"]
+          page_id = os.environ.get("PAGE_ID")
+
+          with open(p, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+
+          data["meta"]["notionPageId"] = page_id
+
+          with open(p, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+          PY
+
+      - name: Commit
+        env:
+          KEY: ${{ steps.key.outputs.key }}
+          MANIFEST_DIR: ${{ inputs.manifest_dir }}
+        run: |
+          set -euo pipefail
+          key="$KEY"
+          manifest_dir="$MANIFEST_DIR"
+
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add "${manifest_dir}/${key}.yml"
+          git commit -m "chore(release): init draft [RN-BOT][RN-START] (${key})"
+          git push
