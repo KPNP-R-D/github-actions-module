@@ -1,0 +1,1273 @@
+name: Release · Generate Notes & Tag (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      catalog_path:
+        type: string
+        required: true
+        description: "서비스 카탈로그 JSON 파일 경로 (e.g. .github/release/service-catalog.json)"
+      prompts_dir:
+        type: string
+        required: true
+        description: "프롬프트 루트 디렉토리 (e.g. prompts)"
+      manifest_dir:
+        type: string
+        required: false
+        default: releases
+        description: "릴리즈 manifest 폴더 (e.g. releases)"
+
+      # =========================
+      # Runtime (caller -> reusable)
+      # =========================
+      inputs_json:
+        type: string
+        required: true
+        description: "toJson(inputs) 결과"
+      current_tags:
+        type: string
+        required: false
+        default: ""
+      release_key:
+        type: string
+        required: false
+        default: ""
+      note:
+        type: string
+        required: false
+        default: ""
+
+      # =========================
+      # Notion options
+      # =========================
+      notion_category:
+        type: string
+        required: true
+        description: "Notion '구분' select 값"
+
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+      NOTION_TOKEN:
+        required: true
+      NOTION_DB_ID:
+        required: true
+      NOTION_DS_NAME:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 태그/히스토리 필요
+
+      - name: Install python deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
+
+      - name: Resolve releaseKey
+        id: key
+        run: |
+          if [ -n "${{ inputs.release_key }}" ]; then
+            echo "key=${{ inputs.release_key }}" >> $GITHUB_OUTPUT
+          else
+            date=$(date +%F)
+            seq=$(printf "%03d" ${{ github.run_number }})
+            echo "key=${date}-${seq}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create manifest (compute config only; no yml)
+        id: manifest
+        env:
+          KEY: ${{ steps.key.outputs.key }}
+          NOTE: ${{ inputs.note }}
+          ACTOR: ${{ github.actor }}
+
+          INPUTS_JSON: ${{ inputs.inputs_json }}
+          CATALOG_PATH: ${{ inputs.catalog_path }}
+
+          # 예: champs=kpnp-champs/v1.0.0,admin=kpnp-admin/v1.0.3
+          # 또는: champs=9f3a1c2,admin=origin/main
+          CURRENT_TAGS: ${{ inputs.current_tags }}
+        run: |
+          set -euo pipefail
+      
+          git fetch --tags --force
+      
+          python - <<'PY'
+          import os, json, subprocess
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import uuid
+      
+          KEY = os.environ["KEY"]
+          NOTE = (os.environ.get("NOTE") or "").strip()
+          ACTOR = os.environ.get("ACTOR", "unknown")
+          CURRENT_RAW = (os.environ.get("CURRENT_TAGS") or "").strip()
+      
+          inputs = json.loads(os.environ["INPUTS_JSON"])
+          services_cfg = json.loads(Path(os.environ["CATALOG_PATH"]).read_text(encoding="utf-8"))
+      
+          def sh(cmd: str) -> str:
+            return subprocess.check_output(cmd, shell=True, text=True).strip()
+      
+          def tag_exists(tag: str) -> bool:
+            try:
+              subprocess.check_output(f"git rev-parse -q --verify refs/tags/{tag}", shell=True, text=True)
+              return True
+            except subprocess.CalledProcessError:
+              return False
+      
+          def rev_exists(rev: str) -> bool:
+            try:
+              subprocess.check_output(f'git rev-parse -q --verify "{rev}^{{commit}}"', shell=True, text=True)
+              return True
+            except subprocess.CalledProcessError:
+              return False
+      
+          def normalize_commit(rev: str) -> str:
+            return sh(f'git rev-parse "{rev}^{{commit}}"')
+      
+          def parse_current_map(raw: str, services_cfg: dict):
+            if not raw:
+              raise SystemExit("current_tags is required. ex) champs=kpnp-champs/v1.0.0,admin=kpnp-admin/v1.0.3")
+      
+            inputkey_to_service = { cfg["inputKey"]: svc for svc, cfg in services_cfg.items() }
+            m = {}
+            for it in [x.strip() for x in raw.split(",") if x.strip()]:
+              if "=" not in it:
+                raise SystemExit(f"Invalid current_tags item (missing '='): {it}")
+              k, v = it.split("=", 1)
+              k, v = k.strip(), v.strip()
+              if not k or not v:
+                raise SystemExit(f"Invalid current_tags item (empty key/value): {it}")
+      
+              if k in services_cfg:
+                svc_key = k
+              elif k in inputkey_to_service:
+                svc_key = inputkey_to_service[k]
+              else:
+                raise SystemExit(f"Unknown service key in current_tags: {k}")
+      
+              if svc_key in m:
+                raise SystemExit(f"Duplicate current_tags key: {svc_key}")
+              m[svc_key] = v
+            return m
+      
+          # included services from checkbox inputs
+          included = []
+          for svc, cfg in services_cfg.items():
+            v = inputs.get(cfg["inputKey"])
+            if v is True or (isinstance(v, str) and v.lower() == "true"):
+              included.append(svc)
+          if not included:
+            raise SystemExit("No services selected (checkboxes).")
+      
+          current_map = parse_current_map(CURRENT_RAW, services_cfg)
+      
+          extra = [k for k in current_map.keys() if k not in included]
+          if extra:
+            raise SystemExit(f"current_tags contains services not selected: {extra}")
+          missing = [svc for svc in included if svc not in current_map]
+          if missing:
+            raise SystemExit(f"current_tags missing for selected services: {missing}")
+      
+          # shared paths merge
+          shared_paths_set = set()
+          for svc in included:
+            for p in (services_cfg[svc].get("sharedPaths") or []):
+              if p and isinstance(p, str):
+                shared_paths_set.add(p.strip())
+          shared_paths = sorted([p for p in shared_paths_set if p])
+      
+          baseline = sh("git rev-parse HEAD")
+          now = datetime.now(timezone.utc).astimezone().isoformat()
+      
+          services = {}
+          for svc in included:
+            cfg = services_cfg[svc]
+            prefix = cfg["tagPrefix"]
+            paths = cfg["servicePaths"]
+            raw_current = current_map[svc]
+      
+            is_tag = tag_exists(raw_current)
+            is_rev = False if is_tag else rev_exists(raw_current)
+            if not is_tag and not is_rev:
+              raise SystemExit(f"{svc}: current '{raw_current}' is neither an existing tag nor a valid git revision")
+      
+            if is_tag:
+              current_type = "tag"
+              current_ref = raw_current
+              current_sha = sh(f'git rev-list -n 1 "{current_ref}"')
+            else:
+              current_type = "commit"
+              current_ref = normalize_commit(raw_current)  # full sha
+              current_sha = current_ref
+      
+            services[svc] = {
+              "paths": paths,
+              "inputKey": cfg["inputKey"],
+              "tagPrefix": prefix,
+              "current": raw_current,
+              "currentType": current_type,
+              "currentRef": current_ref,
+              "currentSha": current_sha,
+            }
+      
+          payload = {
+            "version": 1,
+            "releaseKey": KEY,
+            "environment": "prod",
+            "status": "DRAFT",
+            "shared": {
+              "paths": shared_paths,
+              "policy": {"mode": "separate_section_only"},
+            },
+            "meta": {
+              "createdBy": ACTOR,
+              "createdAt": now,
+              "note": NOTE,
+              "includedServices": included,
+              "baselineHeadSha": baseline,
+            },
+            "services": services,
+          }
+      
+          out_path = os.environ["GITHUB_OUTPUT"]
+          delim = f"__MANIFEST_{uuid.uuid4().hex}__"
+          with open(out_path, "a", encoding="utf-8") as f:
+            f.write(f"manifest_json<<{delim}\n")
+            f.write(json.dumps(payload, ensure_ascii=False))
+            f.write("\n")
+            f.write(f"{delim}\n")
+      
+          # (선택) step summary
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+            with open(summary_path, "a", encoding="utf-8") as s:
+              s.write(f"## release-start: {KEY}\n\n")
+              s.write("### included services\n")
+              s.write("\n".join([f"- {x}" for x in included]) + "\n\n")
+              s.write("### shared\n")
+              s.write(f"- paths: {shared_paths}\n")
+              s.write(f"- mode: separate_section_only\n\n")
+              s.write("### baseline\n")
+              s.write(f"- {baseline}\n\n")
+      
+          print("ok")
+          PY
+
+      - name: Build draft (commit logs)
+        id: build_draft
+        env:
+          KEY: ${{ steps.key.outputs.key }}
+          MANIFEST_JSON: ${{ steps.manifest.outputs.manifest_json }}
+
+          # ✅ indent 레벨 계산 단위(공백 수)
+          # 예: 2면 0~1 => L1, 2~3 => L2, 4~5 => L3
+          INDENT_UNIT: "2"
+
+          # optional: 최대 뎁스 (요구는 3)
+          MAX_DEPTH: "3"
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+
+          draft=$(python - <<'PY'
+          import os, subprocess, json, re, html
+          from datetime import datetime
+
+          def sh(cmd: str) -> str:
+            return subprocess.check_output(cmd, shell=True, text=True).strip()
+
+          GIT_PRETTY = r'%h%x1f%B%x1e'
+
+          INDENT_UNIT = int(os.environ.get("INDENT_UNIT") or "2")
+          MAX_DEPTH = int(os.environ.get("MAX_DEPTH") or "3")
+          if INDENT_UNIT <= 0:
+            INDENT_UNIT = 2
+          if MAX_DEPTH <= 0:
+            MAX_DEPTH = 3
+
+          def list_tags_for_prefix(prefix: str, n: int = 500):
+            cmd = f'git tag --list "{prefix}/v*" --sort=-version:refname | head -n {n}'
+            try:
+              out = sh(cmd)
+            except subprocess.CalledProcessError:
+              out = ""
+            return [x.strip() for x in out.splitlines() if x.strip()] if out else []
+
+          def resolve_prev_tag(prefix: str, current_tag: str):
+            tags = list_tags_for_prefix(prefix, 500)  # 최신 -> 과거
+            if not tags:
+              return None
+            try:
+              idx = tags.index(current_tag)
+            except ValueError:
+              return None
+            return tags[idx + 1] if idx + 1 < len(tags) else None
+
+          def _strip_list_marker(s: str) -> str:
+            t = s.strip()
+            for prefix in ("- ", "* ", "• "):
+              if t.startswith(prefix):
+                return t[len(prefix):].lstrip()
+            m = re.match(r"^\d+[.)]\s+", t)
+            if m:
+              return t[m.end():].lstrip()
+            return t
+
+          def _indent_level(line: str) -> int:
+            """
+            INDENT_UNIT 기반 레벨 계산.
+            - leading spaces 0 => L1
+            - spaces/INDENT_UNIT + 1, MAX_DEPTH로 cap
+            """
+            if not line:
+              return 1
+            expanded = line.replace("\t", " " * INDENT_UNIT)
+            spaces = len(expanded) - len(expanded.lstrip(" "))
+            lvl = spaces // INDENT_UNIT + 1
+            if lvl < 1:
+              lvl = 1
+            if lvl > MAX_DEPTH:
+              lvl = MAX_DEPTH
+            return lvl
+
+          def _bullet_prefix(level: int) -> str:
+            # L1: 2 spaces, L2: 4 spaces, L3: 6 spaces ...
+            return "  " * level + "- "
+
+          def git_log_to_md(cmd: str) -> str:
+            raw = sh(cmd)
+            if not raw.strip():
+              return ""
+
+            chunks = []
+            for rec in raw.split("\x1e"):
+              rec = rec.strip("\n")
+              if not rec:
+                continue
+
+              parts = rec.split("\x1f", 1)
+              if len(parts) != 2:
+                continue
+
+              h = (parts[0] or "").strip()
+              msg = parts[1] or ""
+              lines = msg.splitlines()
+              if not lines:
+                continue
+
+              subject = lines[0].strip()
+
+              # RN-BOT 제외
+              if "[RN-BOT]" in subject or "[RN-BOT]" in msg:
+                continue
+
+              rest = lines[1:]
+              while rest and not rest[0].strip():
+                rest = rest[1:]
+
+              out_lines = [f"- {subject} ({h})"]
+
+              for line in rest:
+                if not line.strip():
+                  continue
+
+                lvl = _indent_level(line)
+                body = _strip_list_marker(line)
+
+                if not body.strip():
+                  continue
+
+                out_lines.append(f"{_bullet_prefix(lvl)}{body}")
+
+              chunks.append("\n".join(out_lines))
+
+            return "\n".join(chunks)
+
+          def build_cmd(current_type: str, current_raw: str, current_ref: str, tag_prefix: str, paths: list[str]):
+            """
+            정책:
+            - tag: prevTag 있으면 prev..current, 없으면 -n80 current
+            - commit: -n80 current_ref(full sha)
+            """
+            paths_part = " ".join([f'"{p}"' for p in (paths or [])])
+
+            if current_type == "tag":
+              prev = resolve_prev_tag(tag_prefix, current_raw)
+              if prev:
+                rev = f'"{prev}..{current_raw}"'
+                cmd = f'git log --pretty=format:"{GIT_PRETTY}" {rev} -- {paths_part}'.strip()
+                return cmd, prev
+              else:
+                rev = f'"{current_raw}"'
+                cmd = f'git log -n 80 --pretty=format:"{GIT_PRETTY}" {rev} -- {paths_part}'.strip()
+                return cmd, None
+
+            rev = f'"{current_ref}"'
+            cmd = f'git log -n 80 --pretty=format:"{GIT_PRETTY}" {rev} -- {paths_part}'.strip()
+            return cmd, None
+
+          key = os.environ["KEY"]
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          data = json.loads(os.environ["MANIFEST_JSON"])
+
+          baseline = data["meta"]["baselineHeadSha"]
+          mode = data.get("shared", {}).get("policy", {}).get("mode")
+          shared_paths = data.get("shared", {}).get("paths", [])
+          included = data.get("meta", {}).get("includedServices", [])
+          services = data.get("services", {})
+
+          out = []
+          debug = {
+            "key": key,
+            "baselineHeadSha": baseline,
+            "indentUnit": INDENT_UNIT,
+            "maxDepth": MAX_DEPTH,
+            "shared.policy.mode": mode,
+            "shared.paths": shared_paths,
+            "meta.includedServices": included,
+            "shared_logs_cmd": None,
+            "shared_logs": None,
+            "services_debug": [],
+          }
+
+          # shared는 기준(current)이 정의 안돼서 baseline 기준 -n80 유지
+          shared_logs = ""
+          if shared_paths:
+            cmd = (
+              f'git log -n 80 --pretty=format:"{GIT_PRETTY}" '
+              f'"{baseline}" -- ' + " ".join([f'"{p}"' for p in shared_paths])
+            )
+            debug["shared_logs_cmd"] = cmd
+            try:
+              shared_logs = git_log_to_md(cmd)
+            except Exception as e:
+              shared_logs = ""
+              debug["shared_logs_error"] = str(e)
+            debug["shared_logs"] = shared_logs
+
+          if shared_paths and mode == "separate_section_only":
+            out.append("## Shared")
+            out.append("### Draft changes")
+            out.append(shared_logs if shared_logs else "- (no commits)")
+            out.append("")
+
+          for svc in included:
+            cfg = services.get(svc, {}) or {}
+            paths = cfg.get("paths", [])
+            tag_prefix = cfg.get("tagPrefix")
+            current_raw = cfg.get("current")
+            current_type = cfg.get("currentType")
+            current_ref = cfg.get("currentRef")
+
+            cmd, prev_tag = build_cmd(current_type, current_raw, current_ref, tag_prefix, paths)
+
+            logs = ""
+            err = None
+            try:
+              logs = git_log_to_md(cmd)
+            except Exception as e:
+              logs = ""
+              err = str(e)
+
+            out.append(f"## {svc}")
+            out.append(f"- current: {current_raw} ({current_type})")
+            out.append(f"- prevTag: {prev_tag}")
+            out.append(f"- paths: {paths}")
+            out.append("### Draft changes")
+            out.append(logs if logs else "- (no commits)")
+
+            if shared_paths and mode == "attach_to_selected_services":
+              out.append("### Shared changes")
+              out.append(shared_logs if shared_logs else "- (no commits)")
+
+            out.append("")
+
+            debug["services_debug"].append({
+              "service": svc,
+              "current": current_raw,
+              "currentType": current_type,
+              "currentRef": current_ref,
+              "prevTag": prev_tag,
+              "paths": paths,
+              "git_log_cmd": cmd,
+              "git_log_error": err,
+              "git_log_output": logs,
+            })
+
+          text = "\n".join(out)
+
+          if summary_path:
+            marker = f"[debug][draft-logs] {key} {datetime.utcnow().isoformat()}Z"
+            with open(summary_path, "a", encoding="utf-8") as summary_fp:
+              summary_fp.write("\n\n---\n")
+              summary_fp.write(f"## {marker}\n")
+              summary_fp.write("\n### Inputs / Resolved values\n")
+              summary_fp.write("```json\n")
+              summary_fp.write(json.dumps(
+                {
+                  "key": debug["key"],
+                  "baselineHeadSha": debug["baselineHeadSha"],
+                  "indentUnit": debug["indentUnit"],
+                  "maxDepth": debug["maxDepth"],
+                  "shared.policy.mode": debug["shared.policy.mode"],
+                  "shared.paths": debug["shared.paths"],
+                  "meta.includedServices": debug["meta.includedServices"],
+                },
+                ensure_ascii=False,
+                indent=2
+              ))
+              summary_fp.write("\n```\n")
+
+              summary_fp.write("\n### Shared logs (cmd + output)\n")
+              summary_fp.write("\n<details>\n")
+              summary_fp.write("<summary>logs</summary>\n\n")
+              summary_fp.write("```text\n")
+              summary_fp.write((debug.get("shared_logs_cmd") or "-") + "\n\n")
+              summary_fp.write((debug.get("shared_logs") or "- (no commits)") + "\n")
+              if debug.get("shared_logs_error"):
+                summary_fp.write("\n[error]\n" + debug["shared_logs_error"] + "\n")
+              summary_fp.write("```\n\n")
+              summary_fp.write("</details>\n")
+
+              summary_fp.write("\n### Services logs (cmd + output)\n")
+              for item in debug.get("services_debug", []):
+                service = item.get("service", "-")
+                paths = item.get("paths") or []
+                paths_str = ", ".join(paths) if isinstance(paths, list) else str(paths)
+
+                summary_fp.write(f"\n#### {service}\n")
+                summary_fp.write("\n<details>\n")
+                summary_fp.write("<summary>logs</summary>\n\n")
+                summary_fp.write("```text\n")
+                summary_fp.write(f"current: {item.get('current')}\n")
+                summary_fp.write(f"currentType: {item.get('currentType')}\n")
+                summary_fp.write(f"prevTag: {item.get('prevTag')}\n")
+                summary_fp.write(f"paths: {paths_str}\n\n")
+                summary_fp.write((item.get("git_log_cmd") or "-") + "\n\n")
+                summary_fp.write((item.get("git_log_output") or "- (no commits)") + "\n")
+                if item.get("git_log_error"):
+                  summary_fp.write("\n[error]\n" + item["git_log_error"] + "\n")
+                summary_fp.write("```\n\n")
+                summary_fp.write("</details>\n")
+
+              summary_fp.write("\n### Draft\n")
+              summary_fp.write("\n<details>\n")
+              summary_fp.write("<summary>logs</summary>\n\n")
+              summary_fp.write("<pre><code>")
+              summary_fp.write(html.escape(text or ""))
+              summary_fp.write("</code></pre>\n\n")
+              summary_fp.write("</details>\n")
+
+          print(text)
+          PY
+          )
+
+          {
+            echo "draft<<__DRAFT__"
+            echo "$draft"
+            echo "__DRAFT__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build Gemini content
+        id: prompt
+        shell: bash
+        env:
+          COMMITS_DRAFT: ${{ steps.build_draft.outputs.draft }}
+          PROMPTS_DIR: ${{ inputs.prompts_dir }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import os, uuid
+
+          prompts_dir = Path(os.environ["PROMPTS_DIR"])
+
+          prompt = (prompts_dir / "gemini/release-notes.system.md").read_text(encoding="utf-8")
+          input_md = (prompts_dir / "gemini/release-notes.input.md").read_text(encoding="utf-8")
+          template = (prompts_dir / "release-notes.template.md").read_text(encoding="utf-8")
+          commits = os.environ.get("COMMITS_DRAFT", "")
+
+          content = (input_md
+            .replace("{{TEMPLATE}}", template)
+            .replace("{{COMMITS}}", commits)
+          )
+
+          out_path = os.environ["GITHUB_OUTPUT"]
+
+          with open(out_path, "a", encoding="utf-8") as f:
+            delim = f"__PROMPT_{uuid.uuid4().hex}__"
+            f.write(f"prompt<<{delim}\n")
+            f.write(prompt + ("\n" if not prompt.endswith("\n") else ""))
+            f.write(f"{delim}\n")
+
+          with open(out_path, "a", encoding="utf-8") as f:
+            delim = f"__CONTENT_{uuid.uuid4().hex}__"
+            f.write(f"content<<{delim}\n")
+            f.write(content + ("\n" if not content.endswith("\n") else ""))
+            f.write(f"{delim}\n")
+          PY
+
+      - name: Gemini refine
+        id: llm
+        if: ${{ steps.prompt.outputs.content != '' }}
+        uses: 5n-project/github-actions-module/actions/gemini-generate@gemini-generate/v1
+        with:
+          api_key: ${{ secrets.GEMINI_API_KEY }}
+          model: gemini-2.5-flash
+          temperature: 0.3
+          max_output_tokens: 50000
+          system_instruction: ${{ steps.prompt.outputs.prompt }}
+          content: ${{ steps.prompt.outputs.content }}
+
+      - name: Append Gemini output to Step Summary
+        shell: bash
+        env:
+          LLM_TEXT: ${{ steps.llm.outputs.text }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          text = os.environ.get("LLM_TEXT", "")
+
+          with open(summary_path, "a", encoding="utf-8") as f:
+            f.write("## Gemini refined release notes\n\n")
+            f.write("```\n")
+            f.write(text)
+            if not text.endswith("\n"):
+              f.write("\n")
+            f.write("```\n")
+          PY
+
+      - name: Create Notion page (draft)
+        id: notion_draft
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
+          NOTION_DS_NAME: ${{ secrets.NOTION_DS_NAME }}
+
+          NOTION_CATEGORY: ${{ inputs.notion_category }}
+
+          KEY: ${{ steps.key.outputs.key }}
+          DRAFT: ${{ steps.build_draft.outputs.draft }}
+          RELEASE_NOTES: ${{ steps.llm.outputs.text }}
+
+          MANIFEST_JSON: ${{ steps.manifest.outputs.manifest_json }}
+        run: |
+          set -euo pipefail
+
+          key="$KEY"
+
+          # =========================================
+          # 0) DB -> data_source_id resolve
+          # =========================================
+          dbres=$(curl -sS -X GET "https://api.notion.com/v1/databases/$NOTION_DB_ID" \
+            -H "Authorization: Bearer $NOTION_TOKEN" \
+            -H "Notion-Version: 2025-09-03" \
+            -H "Content-Type: application/json")
+
+          dataSourceId=$(echo "$dbres" | jq -r --arg name "${NOTION_DS_NAME:-}" '
+            if ($name | length) > 0 then
+              ([.data_sources[]? | select(.name == $name) | .id] | first) // empty
+            else
+              .data_sources[0].id // empty
+            end
+          ')
+
+          if [ -z "$dataSourceId" ]; then
+            echo "Failed to resolve data_source_id."
+            echo "NOTION_DS_NAME='${NOTION_DS_NAME:-}'"
+            echo "Available data_sources:"
+            echo "$dbres" | jq -r '.data_sources[]? | "- \(.name) : \(.id)"' || true
+            echo "Raw response: $dbres"
+            exit 1
+          fi
+
+          echo "Resolved data_source_id=$dataSourceId"
+
+          # =========================================
+          # 배포 버전(=current tag or sha) rich_text 생성
+          # =========================================
+          versions_rich=$(python - <<'PY'
+          import os, json
+
+          data = json.loads(os.environ["MANIFEST_JSON"])
+          included = data["meta"]["includedServices"]
+          services = data.get("services", {})
+
+          def rt(text, code=False):
+            return {
+              "type": "text",
+              "text": {"content": text},
+              "annotations": {
+                "bold": False,
+                "italic": False,
+                "strikethrough": False,
+                "underline": False,
+                "code": bool(code),
+                "color": "default",
+              }
+            }
+
+          out = []
+          for idx, svc in enumerate(included):
+            cfg = services.get(svc, {}) or {}
+            input_key = cfg.get("inputKey") or svc.lower()
+
+            cur_type = cfg.get("currentType") or "tag"
+            cur = cfg.get("current") or "-"
+
+            # commit이면 full sha(currentRef) 기반으로 7자리 축약해서 표시
+            if cur_type == "commit":
+              ref = (cfg.get("currentRef") or "").strip()
+              cur = (ref[:7] if ref else "-")
+
+            out.append(rt(f"{input_key}:"))
+            out.append(rt(cur, code=True) if cur != "-" else rt("-", code=False))
+            if idx != len(included) - 1:
+              out.append(rt("\n"))
+
+          print(json.dumps(out, ensure_ascii=False))
+          PY
+          )
+
+          # =========================================
+          # Notion multi_select(Project) payload용
+          # =========================================
+          projects=$(python - <<'PY'
+          import os, json
+          data = json.loads(os.environ["MANIFEST_JSON"])
+          included = data["meta"]["includedServices"]
+          print(json.dumps([{"name": x} for x in included], ensure_ascii=False))
+          PY
+          )
+
+          # =========================================
+          # 1) Create page (children 최소)
+          # =========================================
+          create_payload=$(jq -n \
+            --arg ds "$dataSourceId" \
+            --arg title "$key" \
+            --arg category "${NOTION_CATEGORY}" \
+            --arg date "$(date +%F)" \
+            --argjson versions "$versions_rich" \
+            --argjson projects "$projects" \
+            '{
+              parent: { data_source_id: $ds },
+              properties: {
+                "제목": { title: [{ text: { content: $title } }] },
+                "구분": { select: { name: $category } },
+                "배포 날짜": { date: { start: $date } },
+                "배포 버전": { rich_text: $versions },
+                "프로젝트": { multi_select: $projects }
+              }
+            }')
+
+          res=$(curl -sS -X POST "https://api.notion.com/v1/pages" \
+            -H "Authorization: Bearer $NOTION_TOKEN" \
+            -H "Notion-Version: 2025-09-03" \
+            -H "Content-Type: application/json" \
+            --data "$create_payload")
+
+          pageId=$(echo "$res" | jq -r '.id')
+          if [ "$pageId" = "null" ] || [ -z "$pageId" ]; then
+            echo "Notion create failed: $res"
+            exit 1
+          fi
+
+          echo "Created pageId=$pageId"
+          echo "page_id=$pageId" >> "$GITHUB_OUTPUT"
+
+          # =========================================
+          # 2) 데이터2 -> 상단 출력(뎁스/서식 유지), 데이터1 -> toggle로
+          #    - hr(---)는 데이터2에서 전부 제거
+          #    - hr은 "4"와 "Raw Draft" 사이에만 1개 삽입
+          # =========================================
+          python - <<'PY'
+          import os, json, re
+
+          release_notes = (os.environ.get("RELEASE_NOTES") or "").strip()
+          draft = (os.environ.get("DRAFT") or "").strip()
+
+          def rt_plain(text: str):
+            return [{"type":"text","text":{"content": (text or "")[:2000]}}]
+
+          def heading2_plain(text: str):
+            return {"object":"block","type":"heading_2","heading_2":{"rich_text": rt_plain(text)}}
+
+          def paragraph_plain(text: str):
+            return {"object":"block","type":"paragraph","paragraph":{"rich_text": rt_plain(text)}}
+
+          def bullet_plain(text: str, children=None):
+            blk = {"object":"block","type":"bulleted_list_item","bulleted_list_item":{"rich_text": rt_plain(text)}}
+            if children:
+              blk["bulleted_list_item"]["children"] = children
+            return blk
+
+          def toggle_plain(text: str):
+            return {"object":"block","type":"toggle","toggle":{"rich_text": rt_plain(text)}}
+
+          def divider():
+            return {"object":"block","type":"divider","divider":{}}
+
+          def clean_dash_prefix(s: str) -> str:
+            t = (s or "").strip()
+            return t[2:].lstrip() if t.startswith("- ") else t
+
+          # ---------- markdown inline -> Notion rich_text ----------
+          def rich_text_from_md(s: str):
+            s = s or ""
+            out = []
+            i = 0
+
+            def push(text, bold=False, italic=False, code=False):
+              if not text:
+                return
+              text = text[:2000]
+              out.append({
+                "type": "text",
+                "text": {"content": text},
+                "annotations": {
+                  "bold": bool(bold),
+                  "italic": bool(italic),
+                  "strikethrough": False,
+                  "underline": False,
+                  "code": bool(code),
+                  "color": "default",
+                }
+              })
+
+            while i < len(s):
+              if s[i] == "`":
+                j = s.find("`", i + 1)
+                if j != -1:
+                  push(s[i+1:j], code=True)
+                  i = j + 1
+                  continue
+
+              if s.startswith("**", i):
+                j = s.find("**", i + 2)
+                if j != -1:
+                  push(s[i+2:j], bold=True)
+                  i = j + 2
+                  continue
+
+              if s[i] == "*":
+                if i + 1 < len(s) and s[i+1] == "*":
+                  pass
+                else:
+                  j = s.find("*", i + 1)
+                  if j != -1:
+                    push(s[i+1:j], italic=True)
+                    i = j + 1
+                    continue
+
+              next_pos = []
+              p = s.find("`", i + 1)
+              if p != -1: next_pos.append(p)
+              p = s.find("**", i + 2)
+              if p != -1: next_pos.append(p)
+              p = s.find("*", i + 1)
+              if p != -1: next_pos.append(p)
+
+              j = min(next_pos) if next_pos else len(s)
+              push(s[i:j])
+              i = j
+
+            return out if out else [{"type":"text","text":{"content":""}}]
+
+          def heading2_md(text: str):
+            return {"object":"block","type":"heading_2","heading_2":{"rich_text": rich_text_from_md(text)}}
+
+          def heading3_md(text: str):
+            return {"object":"block","type":"heading_3","heading_3":{"rich_text": rich_text_from_md(text)}}
+
+          def paragraph_md(text: str):
+            return {"object":"block","type":"paragraph","paragraph":{"rich_text": rich_text_from_md(text)}}
+
+          def bullet_md(text: str):
+            return {"object":"block","type":"bulleted_list_item","bulleted_list_item":{"rich_text": rich_text_from_md(text)}}
+
+          def number_md(text: str):
+            return {"object":"block","type":"numbered_list_item","numbered_list_item":{"rich_text": rich_text_from_md(text)}}
+
+          # ---------- 데이터1(draft) 파싱: 1~3뎁스 지원 ----------
+          section_re = re.compile(r"^##\s+(.+?)\s*$")
+          commit_re  = re.compile(r"^- .+")
+          any_sub_re = re.compile(r"^\s{2,}-\s+.+")  # 2칸 이상이면 sub
+
+          def indent_level_for_draft_line(line: str) -> int:
+            # draft 포맷: "  -"(2) = L1, "    -"(4)=L2, "      -"(6)=L3
+            s = line.replace("\t", "  ")
+            spaces = len(s) - len(s.lstrip(" "))
+            if spaces < 2:
+              return 0
+            lvl = spaces // 2  # 2->1, 4->2, 6->3 ...
+            if lvl < 1: lvl = 1
+            if lvl > 3: lvl = 3
+            return lvl
+
+          sections_order = []
+          sections = {}
+          cur = None
+
+          lines = draft.splitlines()
+          i = 0
+          while i < len(lines):
+            line = lines[i].rstrip()
+
+            m = section_re.match(line)
+            if m:
+              cur = m.group(1)
+              if cur not in sections:
+                sections[cur] = []  # list of trees
+                sections_order.append(cur)
+              i += 1
+              continue
+
+            if cur is None:
+              i += 1
+              continue
+
+            if line.startswith("### "):
+              i += 1
+              continue
+            if line.startswith("- previousTag:") or line.startswith("- paths:") or line.startswith("- current:") or line.startswith("- prevTag:"):
+              i += 1
+              continue
+
+            if commit_re.match(line):
+              title = clean_dash_prefix(line)
+
+              # read following sub bullets (tree up to 3 depth)
+              j = i + 1
+              stack = []  # [(level, node)]
+              root_children = []
+
+              while j < len(lines) and any_sub_re.match(lines[j]):
+                sub_line = lines[j].rstrip()
+                lvl = indent_level_for_draft_line(sub_line)  # 1..3
+                text = clean_dash_prefix(sub_line.strip())
+
+                node = {"text": text, "children": []}
+
+                if not stack:
+                  root_children.append(node)
+                  stack.append((lvl, node))
+                else:
+                  # pop to parent level-1
+                  while stack and stack[-1][0] >= lvl:
+                    stack.pop()
+
+                  if not stack:
+                    root_children.append(node)
+                    stack.append((lvl, node))
+                  else:
+                    parent = stack[-1][1]
+                    parent["children"].append(node)
+                    stack.append((lvl, node))
+
+                j += 1
+
+              sections[cur].append({"title": title, "children": root_children})
+              i = j
+              continue
+
+            i += 1
+
+          def build_bullets_from_tree(nodes):
+            out_blocks = []
+            for n in nodes:
+              kids = build_bullets_from_tree(n.get("children") or [])
+              out_blocks.append(bullet_plain(n.get("text",""), kids if kids else None))
+            return out_blocks
+
+          draft_blocks = []
+          for sec in sections_order:
+            draft_blocks.append(heading2_plain(sec))
+            items = sections.get(sec, [])
+            if not items:
+              draft_blocks.append(paragraph_plain("(no commits)"))
+              continue
+            for item in items:
+              title = item["title"]
+              kids = build_bullets_from_tree(item.get("children") or [])
+              draft_blocks.append(bullet_plain(title, kids if kids else None))
+
+          # ---------- 데이터2(markdown) -> Notion blocks (depth + bold 유지) ----------
+          md_blocks = []
+          if release_notes:
+            lines2 = release_notes.splitlines()
+
+            last_list_at = {}  # (type, level) -> block ref
+            def reset_list_state():
+              last_list_at.clear()
+
+            def md_level(prefix: str) -> int:
+              """
+              들여쓰기 레벨 계산 (유니코드 공백 포함 + 탭 지원)
+              - 탭 1개 = 1레벨
+              - 공백류(isspace) 4개 = 1레벨
+              """
+              if not prefix:
+                return 0
+              lvl = 0
+              space_run = 0
+              for ch in prefix:
+                if ch == "\t":
+                  lvl += 1
+                  space_run = 0
+                  continue
+                if ch.isspace():
+                  space_run += 1
+                  if space_run >= 4:
+                    lvl += 1
+                    space_run = 0
+                  continue
+                break
+              return lvl
+
+            for raw in lines2:
+              line = raw.rstrip("\n")
+              if not line.strip():
+                reset_list_state()
+                continue
+
+              s = line.strip()
+
+              # hr 제거
+              if s == "---":
+                reset_list_state()
+                continue
+
+              if s.startswith("## "):
+                md_blocks.append(heading2_md(s[3:].strip()))
+                reset_list_state()
+                continue
+              if s.startswith("### "):
+                md_blocks.append(heading3_md(s[4:].strip()))
+                reset_list_state()
+                continue
+
+              m = re.match(r"^(\s*)([-*])\s+(.*)$", line)
+              n = re.match(r"^(\s*)(\d+)\.\s+(.*)$", line)
+              if m or n:
+                prefix = (m.group(1) if m else n.group(1))
+                level = md_level(prefix)
+
+                if m:
+                  list_type = "bullet"
+                  text = m.group(3).strip()
+                  blk = bullet_md(text)
+                else:
+                  list_type = "number"
+                  text = n.group(3).strip()
+                  blk = number_md(text)
+
+                # ✅ 레벨 점프 방지: 직전 레벨보다 1 초과면 1로 클램프
+                # (2뎁스 없이 3뎁스만 들어오는 입력/공백흔들림에서 평탄화 방지)
+                if level > 0:
+                  max_parent_level = max([lv for (tp, lv) in last_list_at.keys() if tp in ("bullet", "number")] or [0])
+                  if level > max_parent_level + 1:
+                    level = max_parent_level + 1
+
+                if level <= 0:
+                  md_blocks.append(blk)
+                  last_list_at[(list_type, 0)] = blk
+                else:
+                  parent = last_list_at.get((list_type, level - 1))
+                  if parent is None:
+                    parent = last_list_at.get(("bullet", level - 1)) or last_list_at.get(("number", level - 1))
+
+                  # ✅ 부모 없으면 가장 가까운 상위 레벨로 붙이기(평탄화 방지)
+                  if parent is None:
+                    # 존재하는 레벨들 중 가장 큰 레벨을 부모로
+                    candidates = [(tp, lv) for (tp, lv) in last_list_at.keys() if tp in ("bullet", "number") and lv >= 0]
+                    if candidates:
+                      best_lv = max(lv for (_, lv) in candidates)
+                      parent = last_list_at.get((list_type, best_lv)) or last_list_at.get(("bullet", best_lv)) or last_list_at.get(("number", best_lv))
+                      level = best_lv + 1  # parent의 바로 아래로 강제
+                    else:
+                      md_blocks.append(blk)
+                      last_list_at[(list_type, 0)] = blk
+                      continue
+
+                  if parent["type"] == "bulleted_list_item":
+                    children = parent["bulleted_list_item"].setdefault("children", [])
+                  else:
+                    children = parent["numbered_list_item"].setdefault("children", [])
+                  children.append(blk)
+                  last_list_at[(list_type, level)] = blk
+                continue
+
+              md_blocks.append(paragraph_md(s))
+              reset_list_state()
+
+          children = []
+          children += (md_blocks if md_blocks else [paragraph_plain("(empty)")])
+          children.append(divider())
+          children.append(toggle_plain("Raw Draft (Data 1)"))
+
+          with open("notion_blocks.json", "w", encoding="utf-8") as f:
+            json.dump({"children": children}, f, ensure_ascii=False)
+
+          with open("notion_toggle_children.json", "w", encoding="utf-8") as f:
+            json.dump({"children": draft_blocks if draft_blocks else [paragraph_plain("(empty)")]}, f, ensure_ascii=False)
+
+          print(f"Wrote notion_blocks.json (release_blocks={len(md_blocks)}, draft_blocks={len(draft_blocks)}, total_blocks={len(children)})")
+          PY
+
+          # =========================================
+          # 3-1) page blocks append (95개씩 chunk)
+          # =========================================
+          total=$(jq '.children | length' notion_blocks.json)
+          offset=0
+
+          while [ "$offset" -lt "$total" ]; do
+            jq -c --argjson o "$offset" \
+              '{children: (.children[ $o : ($o+95) ])}' \
+              notion_blocks.json > notion_chunk.json
+
+            cres=$(curl -sS -X PATCH "https://api.notion.com/v1/blocks/$pageId/children" \
+              -H "Authorization: Bearer $NOTION_TOKEN" \
+              -H "Notion-Version: 2025-09-03" \
+              -H "Content-Type: application/json" \
+              --data-binary @notion_chunk.json)
+
+            ok=$(echo "$cres" | jq -r 'if .object=="error" then "false" else "true" end')
+            if [ "$ok" != "true" ]; then
+              echo "::error::Notion append failed offset=$offset res=$cres"
+              exit 1
+            fi
+
+            offset=$((offset+95))
+          done
+
+          # =========================================
+          # 3-2) toggle block id resolve
+          # =========================================
+          toggleId=""
+          cursor=""
+
+          while : ; do
+            if [ -n "$cursor" ]; then
+              url="https://api.notion.com/v1/blocks/$pageId/children?page_size=100&start_cursor=$cursor"
+            else
+              url="https://api.notion.com/v1/blocks/$pageId/children?page_size=100"
+            fi
+
+            list=$(curl -sS -X GET "$url" \
+              -H "Authorization: Bearer $NOTION_TOKEN" \
+              -H "Notion-Version: 2025-09-03" \
+              -H "Content-Type: application/json")
+
+            toggleId=$(echo "$list" | jq -r '
+              .results[]
+              | select(.type=="toggle")
+              | select((.toggle.rich_text[0].plain_text // "") == "Raw Draft (Data 1)")
+              | .id
+            ' | head -n 1)
+
+            if [ -n "$toggleId" ] && [ "$toggleId" != "null" ]; then
+              break
+            fi
+
+            has_more=$(echo "$list" | jq -r '.has_more')
+            if [ "$has_more" != "true" ]; then
+              break
+            fi
+            cursor=$(echo "$list" | jq -r '.next_cursor')
+          done
+
+          if [ -z "$toggleId" ] || [ "$toggleId" = "null" ]; then
+            echo "::error::toggle block not found"
+            exit 1
+          fi
+
+          echo "Resolved toggleId=$toggleId"
+
+          # =========================================
+          # 3-3) toggle children append (95개씩 chunk)
+          # =========================================
+          total=$(jq '.children | length' notion_toggle_children.json)
+          offset=0
+
+          while [ "$offset" -lt "$total" ]; do
+            jq -c --argjson o "$offset" \
+              '{children: (.children[ $o : ($o+95) ])}' \
+              notion_toggle_children.json > notion_toggle_chunk.json
+
+            cres=$(curl -sS -X PATCH "https://api.notion.com/v1/blocks/$toggleId/children" \
+              -H "Authorization: Bearer $NOTION_TOKEN" \
+              -H "Notion-Version: 2025-09-03" \
+              -H "Content-Type: application/json" \
+              --data-binary @notion_toggle_chunk.json)
+
+            ok=$(echo "$cres" | jq -r 'if .object=="error" then "false" else "true" end')
+            if [ "$ok" != "true" ]; then
+              echo "::error::Notion toggle append failed offset=$offset res=$cres"
+              exit 1
+            fi
+
+            offset=$((offset+95))
+          done
+
+      - name: Git user config
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          
+
+      - name: Create & push bundle tag (idempotent + verify)
+        shell: bash
+        env:
+          RELEASE_KEY: ${{ steps.key.outputs.key }}
+        run: |
+          set -euo pipefail
+          
+          TAG="bundle/${RELEASE_KEY}"
+          SHA="$(git rev-parse HEAD)"
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            EXISTING="$(git rev-list -n 1 "${TAG}")"
+            if [ "${EXISTING}" != "${SHA}" ]; then
+              echo "::error::tag already exists but points to different commit. tag=${TAG} existing=${EXISTING} expected=${SHA}"
+              exit 1
+            fi
+            echo "::notice::tag already exists and matches: ${TAG} -> ${SHA}"
+          else
+            git tag -a "${TAG}" "${SHA}" -m "Release bundle ${RELEASE_KEY}"
+            git push origin "${TAG}"
+            echo "::notice::tag pushed: ${TAG} -> ${SHA}"
+          fi
+
+      - name: Create GitHub Release (generate notes)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_KEY: ${{ steps.key.outputs.key }}
+        run: |
+          set -euo pipefail
+          
+          TAG="bundle/${RELEASE_KEY}"
+      
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::release already exists for tag: $TAG"
+            exit 0
+          fi
+      
+          gh release create "$TAG" \
+            --title "Release ${RELEASE_KEY}" \
+            --generate-notes
