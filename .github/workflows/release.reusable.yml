@@ -888,6 +888,9 @@ jobs:
 
             return out if out else [{"type":"text","text":{"content":""}}]
 
+          def heading1_md(text: str):
+            return {"object":"block","type":"heading_1","heading_1":{"rich_text": rich_text_from_md(text)}}
+
           def heading2_md(text: str):
             return {"object":"block","type":"heading_2","heading_2":{"rich_text": rich_text_from_md(text)}}
 
@@ -1051,7 +1054,10 @@ jobs:
               if s == "---":
                 reset_list_state()
                 continue
-
+              if s.startswith("# "):
+                md_blocks.append(heading1_md(s[2:].strip()))
+                reset_list_state()
+                continue
               if s.startswith("## "):
                 md_blocks.append(heading2_md(s[3:].strip()))
                 reset_list_state()
