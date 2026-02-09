@@ -134,6 +134,9 @@ jobs:
           def normalize_commit(rev: str) -> str:
             return sh(f'git rev-parse "{rev}^{{commit}}"')
 
+          def rev_to_sha(rev: str) -> str:
+            return sh(f'git rev-parse "{rev}^{{commit}}"')
+
           def parse_current_map(raw: str, services_cfg: dict):
             if not raw:
               raise SystemExit("current_tags is required. ex) champs=kpnp-champs/v1.0.0,admin=kpnp-admin/v1.0.3")
@@ -160,11 +163,11 @@ jobs:
               m[svc_key] = v
             return m
 
-          def git_epoch_of_sha(sha: str):
-            if not sha:
+          def git_epoch_of_ref(rev: str):
+            if not rev:
               return None
             try:
-              return int(sh(f'git show -s --format=%ct "{sha}"'))
+              return int(sh(f'git show -s --format=%ct "{rev}"'))
             except Exception:
               return None
 
@@ -185,6 +188,34 @@ jobs:
             except ValueError:
               return None
             return tags[idx + 1] if idx + 1 < len(tags) else None
+
+          def oldest_commit_in_paths(paths, baseline: str, n: int = 80):
+            """
+            baseline 기준, 해당 paths에서만 발생한 커밋 중 log -n{n}의 '가장 오래된' 커밋을 반환
+            return: (ts:int, sha:str) or None
+            """
+            if not paths:
+              return None
+            path_args = " ".join([f'"{p}"' for p in paths if p])
+            if not path_args:
+              return None
+
+            # 최신 -> 과거, 마지막 라인이 가장 오래된 커밋
+            cmd = f'git log -n {n} --pretty=format:"%H %ct" "{baseline}" -- {path_args}'
+            try:
+              out = sh(cmd)
+            except subprocess.CalledProcessError:
+              out = ""
+
+            lines = [x.strip() for x in out.splitlines() if x.strip()]
+            if not lines:
+              return None
+
+            sha, ts = lines[-1].split()[:2]
+            try:
+              return (int(ts), sha)
+            except Exception:
+              return None
 
           # included services from checkbox inputs
           included = []
@@ -231,12 +262,12 @@ jobs:
               current_type = "tag"
               current_ref = raw_current
               current_sha = sh(f'git rev-list -n 1 "{current_ref}"')
-              prev_tag = resolve_prev_tag(prefix, raw_current)  # ✅ moved here
+              prev_tag = resolve_prev_tag(prefix, raw_current)
             else:
               current_type = "commit"
               current_ref = normalize_commit(raw_current)  # full sha
               current_sha = current_ref
-              prev_tag = None  # ✅ commit 모드는 prevTag 개념 없음
+              prev_tag = None  # commit 모드는 prevTag 개념 없음(= fallback로 처리)
 
             services[svc] = {
               "paths": paths,
@@ -246,17 +277,32 @@ jobs:
               "currentType": current_type,
               "currentRef": current_ref,
               "currentSha": current_sha,
-              "previousTag": prev_tag,  # ✅ manifest에 고정
+              "previousTag": prev_tag,
             }
 
-          # ✅ globalPrevSha: selected 서비스들의 currentSha 중 "가장 오래된" 커밋 SHA
-          cands = []
+          # ✅ globalPrevSha:
+          # 서비스별로
+          # 1) previousTag 있으면 previousTag의 sha
+          # 2) 없으면 servicePaths 기준 80개 전 커밋 sha
+          # 그 후보들을 모아 timestamp 기준 가장 오래된 sha 선정
+          prev_candidates = []
+
           for svc in included:
-            sha = services[svc]["currentSha"]
-            ts = git_epoch_of_sha(sha)
-            if ts is not None:
-              cands.append((ts, sha))
-          global_prev_sha = min(cands, key=lambda x: x[0])[1] if cands else None
+            prev_tag = services[svc].get("previousTag")
+            if prev_tag:
+              try:
+                prev_sha = rev_to_sha(prev_tag)
+                ts = git_epoch_of_ref(prev_sha)
+                if ts is not None:
+                  prev_candidates.append((ts, prev_sha))
+              except Exception:
+                pass
+            else:
+              r = oldest_commit_in_paths(services[svc]["paths"], baseline, n=80)
+              if r:
+                prev_candidates.append(r)
+
+          global_prev_sha = min(prev_candidates, key=lambda x: x[0])[1] if prev_candidates else None
 
           payload = {
             "version": 1,
