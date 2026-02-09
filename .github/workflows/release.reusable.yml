@@ -97,47 +97,47 @@ jobs:
           CURRENT_TAGS: ${{ inputs.current_tags }}
         run: |
           set -euo pipefail
-      
+
           git fetch --tags --force
-      
+
           python - <<'PY'
           import os, json, subprocess
           from pathlib import Path
           from datetime import datetime, timezone
           import uuid
-      
+
           KEY = os.environ["KEY"]
           NOTE = (os.environ.get("NOTE") or "").strip()
           ACTOR = os.environ.get("ACTOR", "unknown")
           CURRENT_RAW = (os.environ.get("CURRENT_TAGS") or "").strip()
-      
+
           inputs = json.loads(os.environ["INPUTS_JSON"])
           services_cfg = json.loads(Path(os.environ["CATALOG_PATH"]).read_text(encoding="utf-8"))
-      
+
           def sh(cmd: str) -> str:
             return subprocess.check_output(cmd, shell=True, text=True).strip()
-      
+
           def tag_exists(tag: str) -> bool:
             try:
               subprocess.check_output(f"git rev-parse -q --verify refs/tags/{tag}", shell=True, text=True)
               return True
             except subprocess.CalledProcessError:
               return False
-      
+
           def rev_exists(rev: str) -> bool:
             try:
               subprocess.check_output(f'git rev-parse -q --verify "{rev}^{{commit}}"', shell=True, text=True)
               return True
             except subprocess.CalledProcessError:
               return False
-      
+
           def normalize_commit(rev: str) -> str:
             return sh(f'git rev-parse "{rev}^{{commit}}"')
-      
+
           def parse_current_map(raw: str, services_cfg: dict):
             if not raw:
               raise SystemExit("current_tags is required. ex) champs=kpnp-champs/v1.0.0,admin=kpnp-admin/v1.0.3")
-      
+
             inputkey_to_service = { cfg["inputKey"]: svc for svc, cfg in services_cfg.items() }
             m = {}
             for it in [x.strip() for x in raw.split(",") if x.strip()]:
@@ -147,153 +147,26 @@ jobs:
               k, v = k.strip(), v.strip()
               if not k or not v:
                 raise SystemExit(f"Invalid current_tags item (empty key/value): {it}")
-      
+
               if k in services_cfg:
                 svc_key = k
               elif k in inputkey_to_service:
                 svc_key = inputkey_to_service[k]
               else:
                 raise SystemExit(f"Unknown service key in current_tags: {k}")
-      
+
               if svc_key in m:
                 raise SystemExit(f"Duplicate current_tags key: {svc_key}")
               m[svc_key] = v
             return m
-      
-          # included services from checkbox inputs
-          included = []
-          for svc, cfg in services_cfg.items():
-            v = inputs.get(cfg["inputKey"])
-            if v is True or (isinstance(v, str) and v.lower() == "true"):
-              included.append(svc)
-          if not included:
-            raise SystemExit("No services selected (checkboxes).")
-      
-          current_map = parse_current_map(CURRENT_RAW, services_cfg)
-      
-          extra = [k for k in current_map.keys() if k not in included]
-          if extra:
-            raise SystemExit(f"current_tags contains services not selected: {extra}")
-          missing = [svc for svc in included if svc not in current_map]
-          if missing:
-            raise SystemExit(f"current_tags missing for selected services: {missing}")
-      
-          # shared paths merge
-          shared_paths_set = set()
-          for svc in included:
-            for p in (services_cfg[svc].get("sharedPaths") or []):
-              if p and isinstance(p, str):
-                shared_paths_set.add(p.strip())
-          shared_paths = sorted([p for p in shared_paths_set if p])
-      
-          baseline = sh("git rev-parse HEAD")
-          now = datetime.now(timezone.utc).astimezone().isoformat()
-      
-          services = {}
-          for svc in included:
-            cfg = services_cfg[svc]
-            prefix = cfg["tagPrefix"]
-            paths = cfg["servicePaths"]
-            raw_current = current_map[svc]
-      
-            is_tag = tag_exists(raw_current)
-            is_rev = False if is_tag else rev_exists(raw_current)
-            if not is_tag and not is_rev:
-              raise SystemExit(f"{svc}: current '{raw_current}' is neither an existing tag nor a valid git revision")
-      
-            if is_tag:
-              current_type = "tag"
-              current_ref = raw_current
-              current_sha = sh(f'git rev-list -n 1 "{current_ref}"')
-            else:
-              current_type = "commit"
-              current_ref = normalize_commit(raw_current)  # full sha
-              current_sha = current_ref
-      
-            services[svc] = {
-              "paths": paths,
-              "inputKey": cfg["inputKey"],
-              "tagPrefix": prefix,
-              "current": raw_current,
-              "currentType": current_type,
-              "currentRef": current_ref,
-              "currentSha": current_sha,
-            }
-      
-          payload = {
-            "version": 1,
-            "releaseKey": KEY,
-            "environment": "prod",
-            "status": "DRAFT",
-            "shared": {
-              "paths": shared_paths,
-              "policy": {"mode": "separate_section_only"},
-            },
-            "meta": {
-              "createdBy": ACTOR,
-              "createdAt": now,
-              "note": NOTE,
-              "includedServices": included,
-              "baselineHeadSha": baseline,
-            },
-            "services": services,
-          }
-      
-          out_path = os.environ["GITHUB_OUTPUT"]
-          delim = f"__MANIFEST_{uuid.uuid4().hex}__"
-          with open(out_path, "a", encoding="utf-8") as f:
-            f.write(f"manifest_json<<{delim}\n")
-            f.write(json.dumps(payload, ensure_ascii=False))
-            f.write("\n")
-            f.write(f"{delim}\n")
-      
-          # (선택) step summary
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-          if summary_path:
-            with open(summary_path, "a", encoding="utf-8") as s:
-              s.write(f"## release-start: {KEY}\n\n")
-              s.write("### included services\n")
-              s.write("\n".join([f"- {x}" for x in included]) + "\n\n")
-              s.write("### shared\n")
-              s.write(f"- paths: {shared_paths}\n")
-              s.write(f"- mode: separate_section_only\n\n")
-              s.write("### baseline\n")
-              s.write(f"- {baseline}\n\n")
-      
-          print("ok")
-          PY
 
-      - name: Build draft (commit logs)
-        id: build_draft
-        env:
-          KEY: ${{ steps.key.outputs.key }}
-          MANIFEST_JSON: ${{ steps.manifest.outputs.manifest_json }}
-
-          # ✅ indent 레벨 계산 단위(공백 수)
-          # 예: 2면 0~1 => L1, 2~3 => L2, 4~5 => L3
-          INDENT_UNIT: "2"
-
-          # optional: 최대 뎁스 (요구는 3)
-          MAX_DEPTH: "3"
-        run: |
-          set -euo pipefail
-          git fetch --tags --force
-
-          draft=$(python - <<'PY'
-          import os, subprocess, json, re, html
-          from datetime import datetime
-
-          def sh(cmd: str) -> str:
-            return subprocess.check_output(cmd, shell=True, text=True).strip()
-
-          GIT_PRETTY = r'%h%x1f%B%x1e'
-
-          INDENT_UNIT = int(os.environ.get("INDENT_UNIT") or "2")
-          MAX_DEPTH = int(os.environ.get("MAX_DEPTH") or "3")
-          if INDENT_UNIT <= 0:
-            INDENT_UNIT = 2
-          if MAX_DEPTH <= 0:
-            MAX_DEPTH = 3
+          def git_epoch_of_sha(sha: str):
+            if not sha:
+              return None
+            try:
+              return int(sh(f'git show -s --format=%ct "{sha}"'))
+            except Exception:
+              return None
 
           def list_tags_for_prefix(prefix: str, n: int = 500):
             cmd = f'git tag --list "{prefix}/v*" --sort=-version:refname | head -n {n}'
@@ -313,6 +186,153 @@ jobs:
               return None
             return tags[idx + 1] if idx + 1 < len(tags) else None
 
+          # included services from checkbox inputs
+          included = []
+          for svc, cfg in services_cfg.items():
+            v = inputs.get(cfg["inputKey"])
+            if v is True or (isinstance(v, str) and v.lower() == "true"):
+              included.append(svc)
+          if not included:
+            raise SystemExit("No services selected (checkboxes).")
+
+          current_map = parse_current_map(CURRENT_RAW, services_cfg)
+
+          extra = [k for k in current_map.keys() if k not in included]
+          if extra:
+            raise SystemExit(f"current_tags contains services not selected: {extra}")
+          missing = [svc for svc in included if svc not in current_map]
+          if missing:
+            raise SystemExit(f"current_tags missing for selected services: {missing}")
+
+          # shared paths merge
+          shared_paths_set = set()
+          for svc in included:
+            for p in (services_cfg[svc].get("sharedPaths") or []):
+              if p and isinstance(p, str):
+                shared_paths_set.add(p.strip())
+          shared_paths = sorted([p for p in shared_paths_set if p])
+
+          baseline = sh("git rev-parse HEAD")
+          now = datetime.now(timezone.utc).astimezone().isoformat()
+
+          services = {}
+          for svc in included:
+            cfg = services_cfg[svc]
+            prefix = cfg["tagPrefix"]
+            paths = cfg["servicePaths"]
+            raw_current = current_map[svc]
+
+            is_tag = tag_exists(raw_current)
+            is_rev = False if is_tag else rev_exists(raw_current)
+            if not is_tag and not is_rev:
+              raise SystemExit(f"{svc}: current '{raw_current}' is neither an existing tag nor a valid git revision")
+
+            if is_tag:
+              current_type = "tag"
+              current_ref = raw_current
+              current_sha = sh(f'git rev-list -n 1 "{current_ref}"')
+              prev_tag = resolve_prev_tag(prefix, raw_current)  # ✅ moved here
+            else:
+              current_type = "commit"
+              current_ref = normalize_commit(raw_current)  # full sha
+              current_sha = current_ref
+              prev_tag = None  # ✅ commit 모드는 prevTag 개념 없음
+
+            services[svc] = {
+              "paths": paths,
+              "inputKey": cfg["inputKey"],
+              "tagPrefix": prefix,
+              "current": raw_current,
+              "currentType": current_type,
+              "currentRef": current_ref,
+              "currentSha": current_sha,
+              "previousTag": prev_tag,  # ✅ manifest에 고정
+            }
+
+          # ✅ globalPrevSha: selected 서비스들의 currentSha 중 "가장 오래된" 커밋 SHA
+          cands = []
+          for svc in included:
+            sha = services[svc]["currentSha"]
+            ts = git_epoch_of_sha(sha)
+            if ts is not None:
+              cands.append((ts, sha))
+          global_prev_sha = min(cands, key=lambda x: x[0])[1] if cands else None
+
+          payload = {
+            "version": 1,
+            "releaseKey": KEY,
+            "environment": "prod",
+            "status": "DRAFT",
+            "shared": {
+              "paths": shared_paths,
+              "policy": {"mode": "separate_section_only"},
+            },
+            "meta": {
+              "createdBy": ACTOR,
+              "createdAt": now,
+              "note": NOTE,
+              "includedServices": included,
+              "baselineHeadSha": baseline,
+              "globalPrevSha": global_prev_sha,
+            },
+            "services": services,
+          }
+
+          out_path = os.environ["GITHUB_OUTPUT"]
+          delim = f"__MANIFEST_{uuid.uuid4().hex}__"
+          with open(out_path, "a", encoding="utf-8") as f:
+            f.write(f"manifest_json<<{delim}\n")
+            f.write(json.dumps(payload, ensure_ascii=False))
+            f.write("\n")
+            f.write(f"{delim}\n")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+            with open(summary_path, "a", encoding="utf-8") as s:
+              s.write(f"## release-start: {KEY}\n\n")
+              s.write("### included services\n")
+              s.write("\n".join([f"- {x}" for x in included]) + "\n\n")
+              s.write("### shared\n")
+              s.write(f"- paths: {shared_paths}\n")
+              s.write(f"- mode: separate_section_only\n\n")
+              s.write("### baseline\n")
+              s.write(f"- {baseline}\n")
+              s.write("### global prev\n")
+              s.write(f"- {global_prev_sha}\n\n")
+              s.write("### previous tags\n")
+              for svc in included:
+                s.write(f"- {svc}: {services[svc].get('previousTag')}\n")
+              s.write("\n")
+
+          print("ok")
+          PY
+
+      - name: Build draft (commit logs)
+        id: build_draft
+        env:
+          KEY: ${{ steps.key.outputs.key }}
+          MANIFEST_JSON: ${{ steps.manifest.outputs.manifest_json }}
+
+          INDENT_UNIT: "2"
+          MAX_DEPTH: "3"
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          
+          result="$(python - <<'PY'
+          import os, subprocess, json, re, html
+          from datetime import datetime
+          
+          def sh(cmd: str) -> str:
+            return subprocess.check_output(cmd, shell=True, text=True).strip()
+          
+          GIT_PRETTY = r'%h%x1f%B%x1e'
+          
+          INDENT_UNIT = int(os.environ.get("INDENT_UNIT") or "2")
+          MAX_DEPTH = int(os.environ.get("MAX_DEPTH") or "3")
+          if INDENT_UNIT <= 0: INDENT_UNIT = 2
+          if MAX_DEPTH <= 0: MAX_DEPTH = 3
+          
           def _strip_list_marker(s: str) -> str:
             t = s.strip()
             for prefix in ("- ", "* ", "• "):
@@ -322,115 +342,110 @@ jobs:
             if m:
               return t[m.end():].lstrip()
             return t
-
+          
           def _indent_level(line: str) -> int:
-            """
-            INDENT_UNIT 기반 레벨 계산.
-            - leading spaces 0 => L1
-            - spaces/INDENT_UNIT + 1, MAX_DEPTH로 cap
-            """
             if not line:
               return 1
             expanded = line.replace("\t", " " * INDENT_UNIT)
             spaces = len(expanded) - len(expanded.lstrip(" "))
             lvl = spaces // INDENT_UNIT + 1
-            if lvl < 1:
-              lvl = 1
-            if lvl > MAX_DEPTH:
-              lvl = MAX_DEPTH
+            if lvl < 1: lvl = 1
+            if lvl > MAX_DEPTH: lvl = MAX_DEPTH
             return lvl
-
+          
           def _bullet_prefix(level: int) -> str:
-            # L1: 2 spaces, L2: 4 spaces, L3: 6 spaces ...
             return "  " * level + "- "
-
+          
           def git_log_to_md(cmd: str) -> str:
             raw = sh(cmd)
             if not raw.strip():
               return ""
-
+          
             chunks = []
             for rec in raw.split("\x1e"):
               rec = rec.strip("\n")
               if not rec:
                 continue
-
+          
               parts = rec.split("\x1f", 1)
               if len(parts) != 2:
                 continue
-
+          
               h = (parts[0] or "").strip()
               msg = parts[1] or ""
               lines = msg.splitlines()
               if not lines:
                 continue
-
+          
               subject = lines[0].strip()
-
+          
               # RN-BOT 제외
               if "[RN-BOT]" in subject or "[RN-BOT]" in msg:
                 continue
-
+          
               rest = lines[1:]
               while rest and not rest[0].strip():
                 rest = rest[1:]
-
+          
               out_lines = [f"- {subject} ({h})"]
-
+          
               for line in rest:
                 if not line.strip():
                   continue
-
                 lvl = _indent_level(line)
                 body = _strip_list_marker(line)
-
                 if not body.strip():
                   continue
-
                 out_lines.append(f"{_bullet_prefix(lvl)}{body}")
-
+          
               chunks.append("\n".join(out_lines))
-
+          
             return "\n".join(chunks)
-
-          def build_cmd(current_type: str, current_raw: str, current_ref: str, tag_prefix: str, paths: list[str]):
+          
+          def build_cmd_for_service(cfg: dict):
             """
-            정책:
+            manifest에 고정된 previousTag를 사용.
             - tag: prevTag 있으면 prev..current, 없으면 -n80 current
-            - commit: -n80 current_ref(full sha)
+            - commit: -n80 currentRef
             """
-            paths_part = " ".join([f'"{p}"' for p in (paths or [])])
-
+            paths = cfg.get("paths") or []
+            paths_part = " ".join([f'"{p}"' for p in paths])
+          
+            current_type = cfg.get("currentType")
+            current = cfg.get("current")
+            current_ref = cfg.get("currentRef")
+            prev_tag = cfg.get("previousTag")
+          
             if current_type == "tag":
-              prev = resolve_prev_tag(tag_prefix, current_raw)
-              if prev:
-                rev = f'"{prev}..{current_raw}"'
+              if prev_tag:
+                rev = f'"{prev_tag}..{current}"'
                 cmd = f'git log --pretty=format:"{GIT_PRETTY}" {rev} -- {paths_part}'.strip()
-                return cmd, prev
+                return cmd, prev_tag
               else:
-                rev = f'"{current_raw}"'
+                rev = f'"{current}"'
                 cmd = f'git log -n 80 --pretty=format:"{GIT_PRETTY}" {rev} -- {paths_part}'.strip()
                 return cmd, None
-
+          
             rev = f'"{current_ref}"'
             cmd = f'git log -n 80 --pretty=format:"{GIT_PRETTY}" {rev} -- {paths_part}'.strip()
             return cmd, None
-
+          
           key = os.environ["KEY"]
           summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-
           data = json.loads(os.environ["MANIFEST_JSON"])
-
+          
           baseline = data["meta"]["baselineHeadSha"]
+          global_prev = data.get("meta", {}).get("globalPrevSha")
           mode = data.get("shared", {}).get("policy", {}).get("mode")
           shared_paths = data.get("shared", {}).get("paths", [])
           included = data.get("meta", {}).get("includedServices", [])
           services = data.get("services", {})
-
+          
           out = []
           debug = {
             "key": key,
             "baselineHeadSha": baseline,
+            "globalPrevSha": global_prev,
             "indentUnit": INDENT_UNIT,
             "maxDepth": MAX_DEPTH,
             "shared.policy.mode": mode,
@@ -440,13 +455,22 @@ jobs:
             "shared_logs": None,
             "services_debug": [],
           }
-
-          # shared는 기준(current)이 정의 안돼서 baseline 기준 -n80 유지
+          
+          commit_line_re = re.compile(r"(?m)^- .+\([0-9a-f]{7,}\)\s*$")
+          total_commit_count = 0
+          service_commit_counts = {}
+          
+          # shared 범위
           shared_logs = ""
           if shared_paths:
+            if global_prev:
+              rev = f'"{global_prev}..{baseline}"'
+            else:
+              rev = f'"{baseline}"'
+          
             cmd = (
               f'git log -n 80 --pretty=format:"{GIT_PRETTY}" '
-              f'"{baseline}" -- ' + " ".join([f'"{p}"' for p in shared_paths])
+              f'{rev} -- ' + " ".join([f'"{p}"' for p in shared_paths])
             )
             debug["shared_logs_cmd"] = cmd
             try:
@@ -454,24 +478,21 @@ jobs:
             except Exception as e:
               shared_logs = ""
               debug["shared_logs_error"] = str(e)
+          
             debug["shared_logs"] = shared_logs
-
+            if shared_logs:
+              total_commit_count += len(commit_line_re.findall(shared_logs))
+          
           if shared_paths and mode == "separate_section_only":
             out.append("## Shared")
             out.append("### Draft changes")
             out.append(shared_logs if shared_logs else "- (no commits)")
             out.append("")
-
+          
           for svc in included:
             cfg = services.get(svc, {}) or {}
-            paths = cfg.get("paths", [])
-            tag_prefix = cfg.get("tagPrefix")
-            current_raw = cfg.get("current")
-            current_type = cfg.get("currentType")
-            current_ref = cfg.get("currentRef")
-
-            cmd, prev_tag = build_cmd(current_type, current_raw, current_ref, tag_prefix, paths)
-
+            cmd, prev_tag_used = build_cmd_for_service(cfg)
+          
             logs = ""
             err = None
             try:
@@ -479,34 +500,39 @@ jobs:
             except Exception as e:
               logs = ""
               err = str(e)
-
+          
+            c = len(commit_line_re.findall(logs)) if logs else 0
+            service_commit_counts[svc] = c
+            total_commit_count += c
+          
             out.append(f"## {svc}")
-            out.append(f"- current: {current_raw} ({current_type})")
-            out.append(f"- prevTag: {prev_tag}")
-            out.append(f"- paths: {paths}")
+            out.append(f"- current: {cfg.get('current')} ({cfg.get('currentType')})")
+            out.append(f"- prevTag: {prev_tag_used}")
+            out.append(f"- paths: {cfg.get('paths')}")
             out.append("### Draft changes")
             out.append(logs if logs else "- (no commits)")
-
+          
             if shared_paths and mode == "attach_to_selected_services":
               out.append("### Shared changes")
               out.append(shared_logs if shared_logs else "- (no commits)")
-
+          
             out.append("")
-
+          
             debug["services_debug"].append({
               "service": svc,
-              "current": current_raw,
-              "currentType": current_type,
-              "currentRef": current_ref,
-              "prevTag": prev_tag,
-              "paths": paths,
+              "current": cfg.get("current"),
+              "currentType": cfg.get("currentType"),
+              "currentRef": cfg.get("currentRef"),
+              "prevTag": prev_tag_used,
+              "paths": cfg.get("paths"),
               "git_log_cmd": cmd,
               "git_log_error": err,
               "git_log_output": logs,
             })
-
+          
           text = "\n".join(out)
-
+          
+          # 기존 summary dump는 그대로 유지 (원하면 여기 아래에 그대로 넣으면 됨)
           if summary_path:
             marker = f"[debug][draft-logs] {key} {datetime.utcnow().isoformat()}Z"
             with open(summary_path, "a", encoding="utf-8") as summary_fp:
@@ -518,17 +544,20 @@ jobs:
                 {
                   "key": debug["key"],
                   "baselineHeadSha": debug["baselineHeadSha"],
+                  "globalPrevSha": debug["globalPrevSha"],
                   "indentUnit": debug["indentUnit"],
                   "maxDepth": debug["maxDepth"],
                   "shared.policy.mode": debug["shared.policy.mode"],
                   "shared.paths": debug["shared.paths"],
                   "meta.includedServices": debug["meta.includedServices"],
+                  "commit_count_total": total_commit_count,
+                  "service_commit_counts": service_commit_counts,
                 },
                 ensure_ascii=False,
                 indent=2
               ))
               summary_fp.write("\n```\n")
-
+          
               summary_fp.write("\n### Shared logs (cmd + output)\n")
               summary_fp.write("\n<details>\n")
               summary_fp.write("<summary>logs</summary>\n\n")
@@ -539,13 +568,13 @@ jobs:
                 summary_fp.write("\n[error]\n" + debug["shared_logs_error"] + "\n")
               summary_fp.write("```\n\n")
               summary_fp.write("</details>\n")
-
+          
               summary_fp.write("\n### Services logs (cmd + output)\n")
               for item in debug.get("services_debug", []):
                 service = item.get("service", "-")
                 paths = item.get("paths") or []
                 paths_str = ", ".join(paths) if isinstance(paths, list) else str(paths)
-
+          
                 summary_fp.write(f"\n#### {service}\n")
                 summary_fp.write("\n<details>\n")
                 summary_fp.write("<summary>logs</summary>\n\n")
@@ -560,7 +589,7 @@ jobs:
                   summary_fp.write("\n[error]\n" + item["git_log_error"] + "\n")
                 summary_fp.write("```\n\n")
                 summary_fp.write("</details>\n")
-
+          
               summary_fp.write("\n### Draft\n")
               summary_fp.write("\n<details>\n")
               summary_fp.write("<summary>logs</summary>\n\n")
@@ -568,20 +597,41 @@ jobs:
               summary_fp.write(html.escape(text or ""))
               summary_fp.write("</code></pre>\n\n")
               summary_fp.write("</details>\n")
-
-          print(text)
+          
+          # A안: JSON 한 덩어리로 출력
+          print(json.dumps({
+            "draft": text,
+            "has_commits": (total_commit_count > 0),
+            "commit_count": total_commit_count,
+            "service_commit_counts": service_commit_counts,
+          }, ensure_ascii=False))
           PY
-          )
+          )"
+          
+          draft="$(echo "$result" | jq -r '.draft')"
+          has_commits="$(echo "$result" | jq -r '.has_commits')"
+          commit_count="$(echo "$result" | jq -r '.commit_count')"
+          svc_counts="$(echo "$result" | jq -c '.service_commit_counts')"
 
+          delim="__DRAFT_$(openssl rand -hex 16)__"
+          
           {
-            echo "draft<<__DRAFT__"
+            echo "draft<<$delim"
             echo "$draft"
-            echo "__DRAFT__"
+            echo "$delim"
+            echo "has_commits=$has_commits"
+            echo "commit_count=$commit_count"
+            echo "service_commit_counts=$svc_counts"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Fail job if no commit messages
+        if: steps.build_draft.outputs.has_commits != 'true'
+        run: exit 1
 
       - name: Build Gemini content
         id: prompt
         shell: bash
+        if: ${{ steps.build_draft.outputs.has_commits == 'true' }}
         env:
           COMMITS_DRAFT: ${{ steps.build_draft.outputs.draft }}
           PROMPTS_DIR: ${{ inputs.prompts_dir }}
@@ -632,6 +682,7 @@ jobs:
 
       - name: Append Gemini output to Step Summary
         shell: bash
+        if: ${{ steps.llm.outputs.text != '' }}
         env:
           LLM_TEXT: ${{ steps.llm.outputs.text }}
         run: |
@@ -1234,7 +1285,6 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          
 
       - name: Create & push bundle tag (idempotent + verify)
         shell: bash

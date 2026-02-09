@@ -41,6 +41,9 @@ runs:
       run: |
         set -euo pipefail
 
+        # =========
+        # 0) Build request body
+        # =========
         if [ -n "${SYSTEM_INSTRUCTION}" ]; then
           BODY="$(jq -n \
             --arg content "$CONTENT" \
@@ -50,10 +53,7 @@ runs:
             '{
               systemInstruction: { parts: [ { text: $sys } ] },
               contents: [ { role: "user", parts: [ { text: $content } ] } ],
-              generationConfig: {
-                temperature: $temp,
-                maxOutputTokens: $maxTok
-              }
+              generationConfig: { temperature: $temp, maxOutputTokens: $maxTok }
             }')"
         else
           BODY="$(jq -n \
@@ -62,29 +62,94 @@ runs:
             --argjson maxTok "${MAX_OUTPUT_TOKENS}" \
             '{
               contents: [ { role: "user", parts: [ { text: $content } ] } ],
-              generationConfig: {
-                temperature: $temp,
-                maxOutputTokens: $maxTok
-              }
+              generationConfig: { temperature: $temp, maxOutputTokens: $maxTok }
             }')"
         fi
 
-        RESP="$(curl -sS -X POST "https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent" \
-          -H "x-goog-api-key: ${GEMINI_API_KEY}" \
-          -H "Content-Type: application/json" \
-          -d "${BODY}")"
+        # =========
+        # 1) HTTP request (network/timeout/status) hardening
+        # =========
+        url="https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent"
+        resp_file="$(mktemp)"
 
-        if echo "$RESP" | jq -e '.error? != null' >/dev/null; then
-          echo "::error::Gemini API error: $(echo "$RESP" | jq -c '.error')"
+        http_code="$(
+          curl -sS --fail-with-body \
+            --connect-timeout 10 \
+            --max-time 60 \
+            --retry 3 \
+            --retry-delay 1 \
+            --retry-all-errors \
+            -o "$resp_file" \
+            -w "%{http_code}" \
+            -X POST "$url" \
+            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "${BODY}" \
+          || true
+        )"
+
+        # curl 자체 실패(네트워크/timeout 등) -> http_code 비거나 000
+        if [ -z "${http_code}" ] || [ "${http_code}" = "000" ]; then
+          echo "::error::HTTP request failed (network/timeout)."
           exit 1
         fi
 
-        TEXT="$(echo "$RESP" | jq -r '.candidates[0].content.parts[0].text // empty')"
+        RESP="$(cat "$resp_file")"
+
+        # 2xx 아니면 실패 (본문 포함)
+        if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+          echo "::error::HTTP ${http_code} from Gemini API. Body: ${RESP}"
+          exit 1
+        fi
+
+        # =========
+        # 2) JSON parse + API error object
+        # =========
+        echo "$RESP" | jq -e . >/dev/null 2>&1 || {
+          echo "::error::Non-JSON response from Gemini. Raw: ${RESP}"
+          exit 1
+        }
+
+        if echo "$RESP" | jq -e '.error != null' >/dev/null; then
+          code="$(echo "$RESP" | jq -r '.error.code // empty')"
+          status="$(echo "$RESP" | jq -r '.error.status // empty')"
+          msg="$(echo "$RESP" | jq -r '.error.message // empty')"
+
+          if [ "$code" = "429" ] || [ "$status" = "RESOURCE_EXHAUSTED" ]; then
+            echo "::error::Gemini quota/rate limit (429/RESOURCE_EXHAUSTED): $msg"
+          elif [ "$code" = "400" ] || [ "$status" = "INVALID_ARGUMENT" ]; then
+            echo "::error::Gemini invalid request (400/INVALID_ARGUMENT): $msg"
+          elif [ "$code" = "401" ] || [ "$status" = "UNAUTHENTICATED" ]; then
+            echo "::error::Gemini auth failed (401/UNAUTHENTICATED): $msg"
+          elif [ "$code" = "403" ] || [ "$status" = "PERMISSION_DENIED" ]; then
+            echo "::error::Gemini permission denied (403/PERMISSION_DENIED): $msg"
+          else
+            echo "::error::Gemini API error (${code}/${status}): $msg"
+          fi
+          exit 1
+        fi
+
+        # =========
+        # 3) Result validation (empty candidates/text) + parts join
+        # =========
+        TEXT="$(echo "$RESP" | jq -r '
+          (.candidates // []) as $c
+          | if ($c|length)==0 then "" else
+              ($c[0].content.parts // [])
+              | map(.text // "")
+              | join("\n")
+            end
+        ')"
+
         if [ -z "$TEXT" ]; then
-          echo "::error::Gemini returned empty text. Raw response: $RESP"
+          finish_reason="$(echo "$RESP" | jq -r '.candidates[0].finishReason // empty')"
+          echo "::error::Gemini returned empty text. finishReason=${finish_reason}. Raw: ${RESP}"
           exit 1
         fi
-        
+
+        # =========
+        # 4) Output (multi-line safe)
+        # =========
         DELIM="__EOF_$(date +%s%N)__"
         {
           echo "text<<$DELIM"
