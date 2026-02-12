@@ -20,7 +20,7 @@ on:
       make_github_release:
         description: "GitHub Release 생성 여부"
         required: true
-        default: "true"
+        default: "false"
         type: choice
         options: ["true","false"]
 

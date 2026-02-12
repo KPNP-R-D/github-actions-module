@@ -1,0 +1,185 @@
+name: "Build & Push to ECR (Reusable)"
+
+on:
+  workflow_call:
+    inputs:
+      workdir:
+        required: true
+        type: string
+      ecr_repo_uri:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+      platforms:
+        required: false
+        type: string
+        default: "linux/amd64"
+      spring_profiles_active:
+        required: false
+        type: string
+        default: "prod"
+      service:
+        required: false
+        type: string
+        default: ""   # 비면 전체
+      aws_region:
+        required: true
+        type: string
+      environment_name:
+        required: true
+        type: string
+
+    outputs:
+      image_ref:
+        description: "repo:tag"
+        value: ${{ jobs.build_push.outputs.image_ref }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build_push:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment_name }}
+
+    outputs:
+      image_ref: ${{ steps.out.outputs.image_ref }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Buildx (container driver)
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+    # ---------------- AWS/OIDC ----------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push image
+        id: buildpush
+        shell: bash
+        env:
+          WORKDIR: ${{ inputs.workdir }}
+          ECR_REPO_URI: ${{ inputs.ecr_repo_uri }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          PLATFORMS: ${{ inputs.platforms }}
+          SPRING_PROFILES_ACTIVE: ${{ inputs.spring_profiles_active }}
+          SERVICE: ${{ inputs.service || '' }}   # 있으면 연결 (없으면 env로 빈값)
+        run: |
+          set -euo pipefail
+
+          : "${WORKDIR:?::error::workdir is required}"
+          : "${ECR_REPO_URI:?::error::ecr_repo_uri is required}"
+          : "${IMAGE_TAG:?::error::image_tag is required}"
+
+          # Normalize
+          WORKDIR="$(printf '%s' "${WORKDIR}" | tr -d '\r\n' | xargs)"
+          PROFILE="$(printf '%s' "${SPRING_PROFILES_ACTIVE:-}" | tr -d '\r\n' | xargs)"
+          SERVICE="$(printf '%s' "${SERVICE:-}" | tr -d '\r\n' | xargs)"
+
+          ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
+          IMAGE="${ECR_REPO_URI}:${IMAGE_TAG}"
+
+          echo "Root        : ${ROOT}"
+          echo "Workdir     : ${WORKDIR}"
+          echo "Profile     : ${PROFILE}"
+          echo "Service     : ${SERVICE}"
+          echo "Platforms   : ${PLATFORMS}"
+          echo "Target image: ${IMAGE}"
+
+          # Build targets
+          BAKE_TARGETS=()
+          if [[ -n "${SERVICE}" ]]; then
+            SERVICE_NORM="$(echo "${SERVICE}" | tr ',' ' ')"
+            read -r -a BAKE_TARGETS <<< "${SERVICE_NORM}"
+          fi
+
+          # --------------------------------------------
+          # 1) Dockerfile path exists? -> buildx build
+          # --------------------------------------------
+          DOCKERFILE="${ROOT}/${WORKDIR}/Dockerfile"
+          if [[ -f "${DOCKERFILE}" ]]; then
+            echo "Dockerfile detected: ${DOCKERFILE} -> buildx build --push"
+            docker buildx build \
+              --platform "${PLATFORMS}" \
+              --cache-from type=gha \
+              --cache-to type=gha,mode=max \
+              --build-arg SPRING_PROFILES_ACTIVE="${PROFILE}" \
+              -t "${IMAGE}" \
+              -f "${DOCKERFILE}" \
+              "${ROOT}" \
+              --push
+            exit 0
+          fi
+
+          # --------------------------------------------
+          # 2) Compose in WORKDIR -> buildx bake
+          # --------------------------------------------
+          pushd "${ROOT}/${WORKDIR}" >/dev/null
+
+          CF=""
+          if [[ -n "${PROFILE}" && -f "docker-compose.${PROFILE}.yml" ]]; then
+            CF="docker-compose.${PROFILE}.yml"
+          elif [[ -f "docker-compose.yml" ]]; then
+            CF="docker-compose.yml"
+          fi
+
+          [[ -n "${CF}" ]] || { echo "::error::No docker-compose.${PROFILE}.yml and no docker-compose.yml in ${WORKDIR}"; exit 1; }
+
+          echo "Compose file : ${ROOT}/${WORKDIR}/${CF}"
+
+          # Detect if compose uses parent contexts (..), then allow fs.read accordingly
+          # (Simple but effective heuristic)
+          ALLOW_ARGS=()
+          if grep -Eq 'context:\s*\.\.' "${CF}"; then
+            # If you use ../.., you must allow that exact path.
+            # We'll allow ".." and "../.." conservatively if found.
+            if grep -Eq 'context:\s*\.\./\.\.' "${CF}"; then
+              ALLOW_ARGS+=(--allow=fs.read=../..)
+            else
+              ALLOW_ARGS+=(--allow=fs.read=..)
+            fi
+            echo "Bake entitlements: ${ALLOW_ARGS[*]}"
+          fi
+
+          # IMPORTANT:
+          # We run bake from ROOT to make relative paths stable for repo-root builds.
+          # And we pass compose file with absolute path.
+          popd >/dev/null
+
+          COMPOSE_ABS="${ROOT}/${WORKDIR}/${CF}"
+
+          docker buildx bake \
+            "${ALLOW_ARGS[@]}" \
+            --file "${COMPOSE_ABS}" \
+            "${BAKE_TARGETS[@]}" \
+            --set '*.tags'="${IMAGE}" \
+            --set '*.platform'="${PLATFORMS}" \
+            --set '*.cache-from'=type=gha \
+            --set '*.cache-to'=type=gha,mode=max \
+            --set '*.args.SPRING_PROFILES_ACTIVE'="${PROFILE}" \
+            --push
+
+      - name: Output image ref
+        id: out
+        shell: bash
+        env:
+          IMAGE_REF: ${{ inputs.ecr_repo_uri }}:${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Pushed -> ${IMAGE_REF}"

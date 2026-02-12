@@ -1,0 +1,62 @@
+name: "Resolve ECR Image Digest"
+description: "Resolve image digest from ECR using repository+tag"
+
+inputs:
+  aws_region:
+    required: true
+  aws_account_id:
+    required: true
+  repository:
+    description: "ECR repository name (e.g. kpnp-champs)"
+    required: true
+  image_tag:
+    description: "Image tag (e.g. v1.2.3)"
+    required: true
+  ecr_repo_uri:
+    description: "Full ECR repo URI (e.g. 123.dkr.ecr.ap-northeast-2.amazonaws.com/kpnp-champs)"
+    required: true
+
+outputs:
+  image_digest:
+    description: "sha256:..."
+    value: ${{ steps.digest.outputs.image_digest }}
+  image_with_digest:
+    description: "repo@sha256:..."
+    value: ${{ steps.digest.outputs.image_with_digest }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install jq
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update -y
+        sudo apt-get install -y --no-install-recommends jq
+
+    - name: Resolve digest via ECR
+      id: digest
+      shell: bash
+      env:
+        AWS_REGION: ${{ inputs.aws_region }}
+        AWS_ACCOUNT_ID: ${{ inputs.aws_account_id }}
+        REPO: ${{ inputs.repository }}
+        TAG:  ${{ inputs.image_tag }}
+        ECR_REPO_URI: ${{ inputs.ecr_repo_uri }}
+      run: |
+        set -euo pipefail
+
+        # imageDigest 가져오기
+        DIGEST=$(aws ecr describe-images \
+          --region "$AWS_REGION" \
+          --registry-id "$AWS_ACCOUNT_ID" \
+          --repository-name "$REPO" \
+          --image-ids imageTag="$TAG" \
+          --query 'imageDetails[0].imageDigest' \
+          --output text)
+
+        [[ -n "${DIGEST:-}" && "${DIGEST}" != "None" ]] || { echo "::error::Failed to resolve digest from ECR"; exit 1; }
+
+        echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+        echo "image_with_digest=${ECR_REPO_URI}@${DIGEST}" >> "$GITHUB_OUTPUT"
+        echo "::notice::Resolved digest -> ${DIGEST}"

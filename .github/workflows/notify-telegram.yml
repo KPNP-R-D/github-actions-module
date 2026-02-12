@@ -23,6 +23,10 @@ on:
         description: "deploy message (deploy 전송용)"
         required: false
         type: string
+      tag:
+        description: "deployed tag (deploy 전송용)"
+        required: false
+        type: string
 
 jobs:
   format_and_send:

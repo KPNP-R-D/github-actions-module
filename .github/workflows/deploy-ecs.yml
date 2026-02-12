@@ -1,0 +1,105 @@
+name: "ECS Deploy (Reusable)"
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        required: true
+        type: string
+      ecs_cluster:
+        required: true
+        type: string
+      ecs_service:
+        required: true
+        type: string
+      taskdef_artifact:
+        required: true
+        type: string
+      taskdef_path:
+        required: true
+        type: string
+      environment_name:
+        required: true
+        type: string
+
+    outputs:
+      taskdef_arn:
+        value: ${{ jobs.deploy.outputs.taskdef_arn }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment_name }}
+
+    outputs:
+      taskdef_arn: ${{ steps.register.outputs.taskdef_arn }}
+
+    steps:
+      - name: Download taskdef artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.taskdef_artifact }}
+          path: .
+
+    # ---------------- AWS/OIDC ----------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Register task definition
+        id: register
+        shell: bash
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          TASKDEF_PATH: ${{ inputs.taskdef_path }}
+        run: |
+          set -euo pipefail
+          [[ -f "${TASKDEF_PATH}" ]] || { echo "::error::Taskdef not found: ${TASKDEF_PATH}"; exit 1; }
+
+          NEW_TD_ARN=$(aws ecs register-task-definition \
+            --region "${AWS_REGION}" \
+            --cli-input-json file://"${TASKDEF_PATH}" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          [[ -n "${NEW_TD_ARN:-}" && "${NEW_TD_ARN}" != "None" ]] || { echo "::error::Failed to register task definition"; exit 1; }
+
+          echo "taskdef_arn=${NEW_TD_ARN}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Registered -> ${NEW_TD_ARN}"
+
+      - name: Update ECS service
+        shell: bash
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          ECS_CLUSTER: ${{ inputs.ecs_cluster }}
+          ECS_SERVICE: ${{ inputs.ecs_service }}
+          TD_ARN: ${{ steps.register.outputs.taskdef_arn }}
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --region "${AWS_REGION}" \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${ECS_SERVICE}" \
+            --task-definition "${TD_ARN}" \
+            --force-new-deployment >/dev/null
+
+          echo "::notice::Service updated -> ${ECS_SERVICE}"
+
+      - name: Wait for stability
+        shell: bash
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          ECS_CLUSTER: ${{ inputs.ecs_cluster }}
+          ECS_SERVICE: ${{ inputs.ecs_service }}
+        run: |
+          set -euo pipefail
+          aws ecs wait services-stable \
+            --region "${AWS_REGION}" \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}"
+          echo "::notice::Service is stable."

@@ -1,0 +1,128 @@
+name: "resolve-release-version"
+description: "Resolve next release tag for a project: {project}/vX.Y.Z. Supports version_override, bump. Outputs last, next, major."
+
+inputs:
+  project:
+    description: "Project tag prefix (ex: admin, kpnp-champs). Tag format: {project}/vX.Y.Z"
+    required: true
+
+  bump:
+    description: "Version bump unit when version_override is empty. One of: major | minor | patch"
+    required: false
+    default: "patch"
+
+  version_override:
+    description: "Override version in vX.Y.Z. If set, bump is ignored."
+    required: false
+    default: ""
+
+  default_last_version:
+    description: "Fallback last version when no matching tags exist (vX.Y.Z)."
+    required: false
+    default: "v0.0.0"
+
+  fetch_tags:
+    description: "If true, run 'git fetch --tags --force' before resolving."
+    required: false
+    default: "true"
+
+outputs:
+  last_tag:
+    description: "Latest existing tag for the project (ex: admin/v1.2.3)."
+    value: ${{ steps.ver.outputs.last }}
+  next_tag:
+    description: "Next release tag (ex: admin/v1.2.4)."
+    value: ${{ steps.ver.outputs.next }}
+  major_tag:
+    description: "Major tag name (ex: admin/v1) derived from next."
+    value: ${{ steps.ver.outputs.major }}
+  project:
+    description: "Echo project input."
+    value: ${{ steps.ver.outputs.project }}
+  version:
+    description: "Resolved next version only (vX.Y.Z)."
+    value: ${{ steps.ver.outputs.version }}
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Fetch tags (optional)
+      if: ${{ inputs.fetch_tags == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        git fetch --tags --force
+
+    - name: Resolve next version for project
+      id: ver
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        PROJECT="${{ inputs.project }}"
+        OVERRIDE="${{ inputs.version_override }}"
+        BUMP="${{ inputs.bump }}"
+        DEFAULT_LAST_VERSION="${{ inputs.default_last_version }}"
+
+        if [[ -z "${PROJECT}" ]]; then
+          echo "::error::project is required"
+          exit 1
+        fi
+
+        # Find latest tag for this project: {project}/vX.Y.Z
+        LAST_TAG="$(git tag --list "${PROJECT}/v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -n1 || true)"
+
+        if [ -z "${LAST_TAG}" ]; then
+          if [[ ! "${DEFAULT_LAST_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::default_last_version must be vX.Y.Z"
+            exit 1
+          fi
+          LAST_TAG="${PROJECT}/${DEFAULT_LAST_VERSION}"
+        fi
+
+        # Parse last version
+        LAST_VER="${LAST_TAG#${PROJECT}/}"
+        if [[ ! "${LAST_VER}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::Last tag '${LAST_TAG}' is not '{project}/vX.Y.Z'"
+          exit 1
+        fi
+
+        if [ -n "${OVERRIDE}" ]; then
+          if [[ ! "${OVERRIDE}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version_override must be vX.Y.Z (ex: v1.2.3)"
+            exit 1
+          fi
+          NEXT_VER="${OVERRIDE}"
+        else
+          V="${LAST_VER#v}"
+          IFS='.' read -r MA MI PA <<< "${V}"
+
+          case "${BUMP}" in
+            major) MA=$((MA+1)); MI=0; PA=0;;
+            minor) MI=$((MI+1)); PA=0;;
+            patch) PA=$((PA+1));;
+            *) echo "::error::bump must be one of major|minor|patch"; exit 1;;
+          esac
+
+          NEXT_VER="v${MA}.${MI}.${PA}"
+        fi
+
+        NEXT_TAG="${PROJECT}/${NEXT_VER}"
+
+        # major tag: {project}/vX
+        MAJOR="v$(echo "${NEXT_VER}" | cut -d'.' -f1 | tr -d 'v')"
+        MAJOR_TAG="${PROJECT}/${MAJOR}"
+
+        {
+          echo "project=${PROJECT}"
+          echo "last=${LAST_TAG}"
+          echo "next=${NEXT_TAG}"
+          echo "major=${MAJOR_TAG}"
+          echo "version=${NEXT_VER}"
+        } >> "${GITHUB_OUTPUT}"
+
+        echo "Resolved: PROJECT=${PROJECT}, LAST=${LAST_TAG}, NEXT=${NEXT_TAG}, MAJOR=${MAJOR_TAG}"

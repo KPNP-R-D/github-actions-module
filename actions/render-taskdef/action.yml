@@ -1,0 +1,112 @@
+name: "Render ECS Task Definition"
+description: "Render taskdef template json with envsubst, inject env file as container environment, and validate placeholders"
+
+inputs:
+  template_path:
+    description: "Path to taskdef template json"
+    required: true
+  output_path:
+    description: "Output path for rendered taskdef"
+    required: false
+    default: "taskdef.json"
+  env_file_path:
+    description: "Optional .env file to inject into containerDefinitions[].environment (KEY=VALUE per line)"
+    required: false
+    default: ""
+
+outputs:
+  taskdef_path:
+    value: ${{ steps.out.outputs.taskdef_path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install envsubst & jq
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update -y
+        sudo apt-get install -y --no-install-recommends gettext-base jq
+
+    - name: Render task definition (envsubst + env file injection)
+      id: out
+      shell: bash
+      env:
+        TEMPLATE: ${{ inputs.template_path }}
+        OUT: ${{ inputs.output_path }}
+        ENV_FILE: ${{ inputs.env_file_path }}
+      run: |
+        set -euo pipefail
+        [[ -f "${TEMPLATE}" ]] || { echo "::error::Template not found: ${TEMPLATE}"; exit 1; }
+
+        # 1) env 파일 -> ECS environment JSON 배열로 변환
+        # 기본값은 빈 배열
+        ENVIRONMENT_JSON='[]'
+
+        if [[ -n "${ENV_FILE}" ]]; then
+          [[ -f "${ENV_FILE}" ]] || { echo "::error::Env file not found: ${ENV_FILE}"; exit 1; }
+
+          # env 파일 파싱: 빈줄/주석(#) 무시, KEY=VALUE만 허용
+          # value는 '=' 포함 가능하도록 첫 '='만 split
+          ENVIRONMENT_JSON="$(
+            jq -n --argfile dummy /dev/null '
+              []
+            ' >/dev/null 2>&1 || true
+
+            # bash에서 JSON을 누적 생성
+            json='[]'
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              # trim
+              line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+              [[ -z "$line" ]] && continue
+              [[ "$line" =~ ^# ]] && continue
+
+              # KEY=VALUE 형태 체크
+              if [[ "$line" != *"="* ]]; then
+                echo "::error::Invalid env line (missing '='): $line"
+                exit 1
+              fi
+
+              key="${line%%=*}"
+              val="${line#*=}"
+
+              # key trim
+              key="$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+              # value trim (원하면 공백 유지로 바꿔도 됨)
+              val="$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+              # KEY 유효성(대문자/숫자/_ 관례)
+              if ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                echo "::error::Invalid env key: $key"
+                exit 1
+              fi
+
+              json="$(jq -c --arg name "$key" --arg value "$val" '. + [{"name":$name,"value":$value}]' <<<"$json")"
+            done < "${ENV_FILE}"
+
+            echo "$json"
+          )"
+        fi
+
+        export ENVIRONMENT_JSON
+
+        # 2) 렌더
+        envsubst < "${TEMPLATE}" | jq . > "${OUT}"
+
+        # 3) 치환 안된 placeholder 검사
+        if grep -R '\${[A-Za-z_][A-Za-z0-9_]*}' -n "${OUT}"; then
+          echo "::error::Unreplaced placeholders remain in ${OUT}"
+          exit 1
+        fi
+
+        # 4) 로그용 sanitize (secrets/environment 민감 키 제거)
+        jq ' .containerDefinitions |= map(
+                del(.secrets)
+                | ( .environment? // [] ) as $env
+                | .environment = ($env | map(select(.name|test("PASSWORD|SECRET|KEY|TOKEN"; "i")|not)))
+              )' "${OUT}" > taskdef.sanitized.json
+
+        echo "::notice::Rendered taskdef -> ${OUT}"
+        echo "taskdef_path=${OUT}" >> "$GITHUB_OUTPUT"
+        echo "Sanitized preview:"
+        cat taskdef.sanitized.json

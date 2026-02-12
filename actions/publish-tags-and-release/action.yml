@@ -1,0 +1,181 @@
+name: "Publish Tags And Release"
+description: "Create/push annotated release tag ({project}/vX.Y.Z), move prod tag ({project}/prod) to it, and optionally create a GitHub Release."
+
+inputs:
+  # Required
+  project:
+    description: "Project tag prefix. Tag format: {project}/vX.Y.Z and {project}/prod"
+    required: true
+  next_tag:
+    description: "Full release tag to create/push (ex: admin/v1.2.3)"
+    required: true
+  prod_tag:
+    description: "Full prod tag to move (ex: admin/prod)"
+    required: true
+
+  # Optional
+  release_notes:
+    description: "Optional release notes text"
+    required: false
+    default: ""
+  make_github_release:
+    description: "If true, create GitHub Release for next_tag (uses GH_TOKEN)"
+    required: false
+    default: "false"
+  allow_move_existing_release_tag:
+    description: "If true, overwrite existing next_tag locally/remotely (force move). Default false."
+    required: false
+    default: "false"
+  force_update_prod_tag:
+    description: "If true, force-push prod tag update (recommended true)."
+    required: false
+    default: "true"
+
+  git_user_name:
+    description: "Git user.name for annotated tag creation"
+    required: false
+    default: "github-actions[bot]"
+  git_user_email:
+    description: "Git user.email for annotated tag creation"
+    required: false
+    default: "41898282+github-actions[bot]@users.noreply.github.com"
+
+outputs:
+  next_tag:
+    description: "Echo next_tag"
+    value: ${{ steps.out.outputs.next_tag }}
+  prod_tag:
+    description: "Echo prod_tag"
+    value: ${{ steps.out.outputs.prod_tag }}
+  release_created:
+    description: "true if GitHub Release created, false otherwise"
+    value: ${{ steps.out.outputs.release_created }}
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Git user config
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config user.name  "${{ inputs.git_user_name }}"
+        git config user.email "${{ inputs.git_user_email }}"
+
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        PROJECT="${{ inputs.project }}"
+        NEXT="${{ inputs.next_tag }}"
+        PROD="${{ inputs.prod_tag }}"
+
+        if [[ -z "${PROJECT}" ]]; then echo "::error::project is required"; exit 1; fi
+        if [[ -z "${NEXT}" ]]; then echo "::error::next_tag is required"; exit 1; fi
+        if [[ -z "${PROD}" ]]; then echo "::error::prod_tag is required"; exit 1; fi
+
+        if [[ ! "${NEXT}" =~ ^${PROJECT}/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::next_tag must be '${PROJECT}/vX.Y.Z' (got: ${NEXT})"
+          exit 1
+        fi
+        if [[ "${PROD}" != "${PROJECT}/prod" ]]; then
+          echo "::error::prod_tag must be exactly '${PROJECT}/prod' (got: ${PROD})"
+          exit 1
+        fi
+
+    - name: Fetch tags
+      shell: bash
+      run: |
+        set -euo pipefail
+        git fetch --tags --force
+
+    - name: Create or move release tag (annotated) and push
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        NEXT="${{ inputs.next_tag }}"
+        NOTES="${{ inputs.release_notes }}"
+        ALLOW_MOVE="${{ inputs.allow_move_existing_release_tag }}"
+
+        msg="Release ${NEXT}"
+        if [ -n "${NOTES}" ]; then
+          msg="${msg}"$'\n\n'"${NOTES}"
+        fi
+
+        if git rev-parse -q --verify "refs/tags/${NEXT}" >/dev/null; then
+          if [[ "${ALLOW_MOVE}" == "true" ]]; then
+            echo "Tag ${NEXT} already exists locally; overwriting because allow_move_existing_release_tag=true"
+            git tag -fa "${NEXT}" -m "${msg}"
+          else
+            echo "::error::Tag ${NEXT} already exists. Refusing to overwrite. Set allow_move_existing_release_tag=true to force."
+            exit 1
+          fi
+        else
+          git tag -a "${NEXT}" -m "${msg}"
+        fi
+
+        if [[ "${ALLOW_MOVE}" == "true" ]]; then
+          git push origin "${NEXT}" --force
+        else
+          git push origin "${NEXT}"
+        fi
+
+    - name: Move prod tag to release tag and push
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        NEXT="${{ inputs.next_tag }}"
+        PROD="${{ inputs.prod_tag }}"
+        FORCE_PROD="${{ inputs.force_update_prod_tag }}"
+
+        git tag -fa "${PROD}" -m "Update ${PROD} to ${NEXT}"
+
+        if [[ "${FORCE_PROD}" == "true" ]]; then
+          git push origin "${PROD}" --force
+        else
+          git push origin "${PROD}"
+        fi
+
+    - name: Create GitHub Release (optional)
+      if: ${{ inputs.make_github_release == 'true' }}
+      env:
+        GH_TOKEN: ${{ env.GH_TOKEN }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        NEXT="${{ inputs.next_tag }}"
+        NOTES="${{ inputs.release_notes }}"
+
+        if [ -z "${GH_TOKEN:-}" ]; then
+          echo "::error::GH_TOKEN env is required when make_github_release=true"
+          exit 1
+        fi
+
+        if gh release view "${NEXT}" >/dev/null 2>&1; then
+          echo "Release ${NEXT} already exists. Skipping."
+        else
+          if [ -n "${NOTES}" ]; then
+            gh release create "${NEXT}" -t "${NEXT}" -n "${NOTES}"
+          else
+            gh release create "${NEXT}" -t "${NEXT}" -n "Release ${NEXT}"
+          fi
+        fi
+
+    - name: Outputs
+      id: out
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "next_tag=${{ inputs.next_tag }}" >> "${GITHUB_OUTPUT}"
+        echo "prod_tag=${{ inputs.prod_tag }}" >> "${GITHUB_OUTPUT}"
+        if [[ "${{ inputs.make_github_release }}" == "true" ]]; then
+          echo "release_created=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "release_created=false" >> "${GITHUB_OUTPUT}"
+        fi
