@@ -36,70 +36,67 @@ jobs:
           fetch-depth: 0
 
       # message 우선순위 결정
+      # 신뢰할 수 없는 값(커밋 메시지·PR 제목 등)은 ${{ }}로 스크립트에 인라인하지 않고
+      # env로 전달한다. 인라인하면 값에 포함된 $·따옴표 등이 셸로 해석되어 깨지고(스크립트
+      # 인젝션), set -u 환경에서 "unbound variable" 등으로 실패한다.
       - name: Build unified message
         id: msg
         shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          REF: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ inputs.event_kind }}
+          IN_PROJECT: ${{ inputs.project }}
+          IN_ENV: ${{ inputs.environment }}
+          IN_RESULT: ${{ inputs.result }}
+          IN_MESSAGE: ${{ inputs.message }}
+          PUSH_MESSAGE: ${{ github.event.head_commit.message }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
 
-          REPO="${{ github.repository }}"
-          ACTOR="${{ github.actor }}"
-          REF="${{ github.ref_name }}"
-          RUN_URL="https://github.com/${REPO}/actions/runs/${{ github.run_id }}"
-          EVENT="${{ inputs.event_kind }}"
-
-          # 커밋 정보 (없어도 실패하지 않도록)
-          COMMIT_MSG="$(git log -1 --pretty=%s 2>/dev/null || true)"
+          RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
           COMMITS_URL="https://github.com/${REPO}/commits/${REF}"
+          COMMIT_MSG="$(git log -1 --pretty=%s 2>/dev/null || true)"
 
-          case "$EVENT" in
+          case "${EVENT}" in
             deploy)
-              PROJECT="${{ inputs.project }}"
-              ENVNAME="${{ inputs.environment }}"
-              RESULT="${{ inputs.result }}"
-              IMAGE="${{ inputs.image }}"
-              TAG="${{ inputs.tag }}"
-          
-              INPUT_MESSAGE="${{ inputs.message || '' }}"
-              PUSH_MESSAGE="${{ github.event.head_commit.message || '' }}"
-              PR_TITLE="${{ github.event.pull_request.title || '' }}"    
-
-              MESSAGE="${INPUT_MESSAGE}"
-              if [[ -z "$MESSAGE" && -n "${PUSH_MESSAGE}" ]]; then
-              MESSAGE="${PUSH_MESSAGE}"
+              MESSAGE="${IN_MESSAGE:-}"
+              if [[ -z "$MESSAGE" && -n "${PUSH_MESSAGE:-}" ]]; then
+                MESSAGE="${PUSH_MESSAGE}"
               fi
-              if [[ -z "$MESSAGE" && -n "${PR_TITLE}" ]]; then
-              MESSAGE="${PR_TITLE}"
+              if [[ -z "$MESSAGE" && -n "${PR_TITLE:-}" ]]; then
+                MESSAGE="${PR_TITLE}"
               fi
               if [[ -z "$MESSAGE" ]]; then
-              MESSAGE="$(git log -1 --pretty=%s 2>/dev/null || true)"
+                MESSAGE="${COMMIT_MSG}"
               fi
               if [[ -z "$MESSAGE" ]]; then
-              MESSAGE="deploy by ${{ github.actor }}"
+                MESSAGE="deploy by ${ACTOR}"
               fi
               MESSAGE="${MESSAGE%%$'\n'*}"
-    
-              if [[ "${RESULT:-}" == "success" ]]; then
+
+              if [[ "${IN_RESULT:-}" == "success" ]]; then
                 ICON="✅"; RESULT_UPPER="SUCCESS"
               else
                 ICON="❌"; RESULT_UPPER="FAILED"
               fi
-          
+
               MSG="${ICON} *DEPLOY ${RESULT_UPPER}*
-              Project: ${PROJECT}
-              Env:     ${ENVNAME}
-              Message: ${MESSAGE}"
-                [[ -n "${TAG:-}"   ]] && MSG="${MSG}
-              Tag:     ${TAG}"
-                [[ -n "${IMAGE:-}" ]] && MSG="${MSG}
-              Image:   ${IMAGE}"
-                [[ -n "${IMAGE:-}" ]] && MSG="${MSG}
-              Image:   ${IMAGE}"
-                MSG="${MSG}
-          
+              Project: ${IN_PROJECT:-}
+              Env:     ${IN_ENV:-}
+              Message: ${MESSAGE}
+
               ▶️ Workflow Run: ${RUN_URL}"
-            ;;
-          
+              ;;
+
             push)
               # head_commit.message가 없을 수도 있으니 COMMIT_MSG로 대체
               TITLE="${COMMIT_MSG}"
@@ -107,59 +104,45 @@ jobs:
               Repo: ${REPO}
               By: ${ACTOR}
               Message: ${TITLE}
-          
+
               ▶️ Recent Commits: ${COMMITS_URL}
               ▶️ Workflow Run: ${RUN_URL}"
-            ;;
+              ;;
 
             pr)
-              PR_NUM="${{ github.event.pull_request.number }}"
-              PR_TITLE="${{ github.event.pull_request.title }}"
-              PR_USER="${{ github.event.pull_request.user.login }}"
-              PR_URL="${{ github.event.pull_request.html_url }}"
-              BASE="${{ github.event.pull_request.base.ref }}"
-              HEAD="${{ github.event.pull_request.head.ref }}"
-          
-              MSG="🧩 *PR to ${BASE}*
+              MSG="🧩 *PR to ${PR_BASE:-}*
               Repo: ${REPO}
-              PR: #${PR_NUM} - ${PR_TITLE}
-              From: ${HEAD} → ${BASE}
-              By: ${PR_USER}
-          
-              ▶️ PR: ${PR_URL}
+              PR: #${PR_NUM:-} - ${PR_TITLE:-}
+              From: ${PR_HEAD:-} → ${PR_BASE:-}
+              By: ${PR_USER:-}
+
+              ▶️ PR: ${PR_URL:-}
               ▶️ Workflow Run: ${RUN_URL}"
-            ;;
-          
+              ;;
+
             merge)
-              PR_NUM="${{ github.event.pull_request.number }}"
-              PR_TITLE="${{ github.event.pull_request.title }}"
-              MERGER="${ACTOR}"
-              PR_URL="${{ github.event.pull_request.html_url }}"
-              BASE="${{ github.event.pull_request.base.ref }}"
-              HEAD="${{ github.event.pull_request.head.ref }}"
-          
-              MSG="✅ *MERGED into ${BASE}*
+              MSG="✅ *MERGED into ${PR_BASE:-}*
               Repo: ${REPO}
-              PR: #${PR_NUM} - ${PR_TITLE}
-              From: ${HEAD} → ${BASE}
-              Merged By: ${MERGER}
-          
-              ▶️ PR: ${PR_URL}
+              PR: #${PR_NUM:-} - ${PR_TITLE:-}
+              From: ${PR_HEAD:-} → ${PR_BASE:-}
+              Merged By: ${ACTOR}
+
+              ▶️ PR: ${PR_URL:-}
               ▶️ Workflow Run: ${RUN_URL}"
               ;;
-          
-              *)
-                MSG="ℹ️ Unsupported event_kind: ${EVENT}
-                Repo: ${REPO}
-                ▶️ Workflow Run: ${RUN_URL}"
+
+            *)
+              MSG="ℹ️ Unsupported event_kind: ${EVENT}
+              Repo: ${REPO}
+              ▶️ Workflow Run: ${RUN_URL}"
               ;;
-          
-              esac  
-              {
-                printf 'text<<EOF\n'
-                printf '%s\n' "$MSG"
-                printf 'EOF\n'
-              } >> "$GITHUB_OUTPUT"
+          esac
+
+          {
+            printf 'text<<EOF\n'
+            printf '%s\n' "$MSG"
+            printf 'EOF\n'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Decide chat target by event_kind
         id: route
@@ -174,7 +157,7 @@ jobs:
           merge)  TO="${{ secrets.TELEGRAM_TO_MERGE }}"  ;;
           deploy) TO="${{ secrets.TELEGRAM_TO_DEPLOY }}" ;;
           *)      TO="" ;;
-          
+
           esac
           [[ -z "${TO:-}" ]] && TO="$TO_DEFAULT"
           echo "to=$TO" >> "$GITHUB_OUTPUT"
