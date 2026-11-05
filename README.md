@@ -21,7 +21,7 @@
 
 * **Reusable Notify**
 
-  * `push | pr | merge | deploy` 이벤트별 메시지 포맷 통일 + 텔레그램 채널 라우팅 전송
+  * v2: PR·배포 알림을 전 레포 공통 서식(HTML · 🧩✅❌)으로 텔레그램에 전송 — [docs/workflows/notify-telegram.md](docs/workflows/notify-telegram.md)
 
 ### Release Automation
 
@@ -87,12 +87,6 @@
 ---
 
 ## Notes / Known Issues (현 상태 기준)
-
-* **Reusable Notify**
-
-  * `inputs.image`를 참조하지만 inputs에 정의가 없음
-  * deploy 메시지에서 `Image:` 출력 라인이 중복됨
-    → 문서/구현 정리 시 같이 수정 권장
 
 * **Resolve ECR Image Digest**
 

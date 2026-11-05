@@ -1,177 +1,226 @@
 name: Reusable Notify
 
+# v2 — PR·배포 알림을 전 레포 공통 서식(HTML)으로 보낸다. 서식과 호출 계약은 docs/workflows/notify-telegram.md
 on:
   workflow_call:
     inputs:
       event_kind:
-        description: "push | pr | merge | deploy"
+        description: "pr | deploy"
         required: true
         type: string
       project:
-        description: "project/service name (deploy 전송용)"
+        description: "프로젝트/서비스명 (deploy)"
         required: false
         type: string
       environment:
-        description: "environment (dev|stg|prod 등, deploy 전송용)"
+        description: "dev | stg | prod 등 (deploy)"
         required: false
         type: string
       result:
-        description: "deploy result (success|failure, deploy 전송용)"
+        description: "success | failure 만 보낸다. cancelled·skipped 는 보내지 않는다 (deploy)"
         required: false
         type: string
       message:
-        description: "deploy message (deploy 전송용)"
+        description: "배포 메모 (deploy)"
         required: false
         type: string
       tag:
-        description: "deployed tag (deploy 전송용)"
+        description: "배포한 태그 (deploy)"
         required: false
         type: string
+      url:
+        description: "배포된 서비스 주소 (deploy)"
+        required: false
+        type: string
+    secrets:
+      TELEGRAM_TOKEN:
+        required: false
+      TELEGRAM_TO_PR:
+        required: false
+      TELEGRAM_TO_DEPLOY:
+        required: false
 
 jobs:
-  format_and_send:
+  send:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout caller repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository }}
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-
-      # message 우선순위 결정
-      # 신뢰할 수 없는 값(커밋 메시지·PR 제목 등)은 ${{ }}로 스크립트에 인라인하지 않고
-      # env로 전달한다. 인라인하면 값에 포함된 $·따옴표 등이 셸로 해석되어 깨지고(스크립트
-      # 인젝션), set -u 환경에서 "unbound variable" 등으로 실패한다.
-      - name: Build unified message
+      # 신뢰할 수 없는 값(PR 제목·커밋 메시지·입력값)은 ${{ }} 로 스크립트에 인라인하지 않고 env·이벤트 파일로만 읽는다
+      - name: Build message
         id: msg
         shell: bash
         env:
-          REPO: ${{ github.repository }}
-          ACTOR: ${{ github.actor }}
-          REF: ${{ github.ref_name }}
-          RUN_ID: ${{ github.run_id }}
-          EVENT: ${{ inputs.event_kind }}
+          GH_TOKEN: ${{ github.token }}
+          EVENT_KIND: ${{ inputs.event_kind }}
           IN_PROJECT: ${{ inputs.project }}
           IN_ENV: ${{ inputs.environment }}
           IN_RESULT: ${{ inputs.result }}
           IN_MESSAGE: ${{ inputs.message }}
-          PUSH_MESSAGE: ${{ github.event.head_commit.message }}
-          PR_NUM: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_USER: ${{ github.event.pull_request.user.login }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          PR_BASE: ${{ github.event.pull_request.base.ref }}
-          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          IN_TAG: ${{ inputs.tag }}
+          IN_URL: ${{ inputs.url }}
         run: |
           set -euo pipefail
 
-          RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
-          COMMITS_URL="https://github.com/${REPO}/commits/${REF}"
-          COMMIT_MSG="$(git log -1 --pretty=%s 2>/dev/null || true)"
+          EV="$GITHUB_EVENT_PATH"
+          REPO="$GITHUB_REPOSITORY"
+          SERVER="${GITHUB_SERVER_URL:-https://github.com}"
 
-          case "${EVENT}" in
-            deploy)
-              MESSAGE="${IN_MESSAGE:-}"
-              if [[ -z "$MESSAGE" && -n "${PUSH_MESSAGE:-}" ]]; then
-                MESSAGE="${PUSH_MESSAGE}"
-              fi
-              if [[ -z "$MESSAGE" && -n "${PR_TITLE:-}" ]]; then
-                MESSAGE="${PR_TITLE}"
-              fi
-              if [[ -z "$MESSAGE" ]]; then
-                MESSAGE="${COMMIT_MSG}"
-              fi
-              if [[ -z "$MESSAGE" ]]; then
-                MESSAGE="deploy by ${ACTOR}"
-              fi
-              MESSAGE="${MESSAGE%%$'\n'*}"
+          esc() { printf '%s' "${1-}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+          link() { printf '<a href="%s">%s</a>' "$(esc "$1")" "$2"; }
+          ev() { jq -r "$1 // empty" "$EV"; }
+          skip() { echo "::notice::$1 — 알림을 보내지 않는다"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          # gh api 는 HTTP 오류에도 응답 본문을 stdout 에 낸다 — 성공했을 때만 본문을 돌려준다
+          api() { local out; if out="$(gh api "$@" 2>/dev/null)"; then printf '%s' "$out"; fi; }
 
-              if [[ "${IN_RESULT:-}" == "success" ]]; then
-                ICON="✅"; RESULT_UPPER="SUCCESS"
-              else
-                ICON="❌"; RESULT_UPPER="FAILED"
-              fi
+          # 한 줄에 「항목: 값」 하나 — 입력값은 첫 줄만 쓴다
+          for v in IN_PROJECT IN_ENV IN_MESSAGE IN_TAG IN_URL; do printf -v "$v" '%s' "${!v%%$'\n'*}"; done
 
-              MSG="${ICON} *DEPLOY ${RESULT_UPPER}*
-              Repo:    ${REPO#*/}
-              Project: ${IN_PROJECT:-}
-              Env:     ${IN_ENV:-}
-              Branch:  ${PR_BASE:-$REF}
-              By:      ${ACTOR}
-              Message: ${MESSAGE}
+          LINES=()
+          add() { if [[ -n "${2-}" ]]; then LINES+=("$1: $2"); fi; }
 
-              ▶️ Workflow Run: ${RUN_URL}"
-              ;;
-
-            push)
-              # head_commit.message가 없을 수도 있으니 COMMIT_MSG로 대체
-              TITLE="${COMMIT_MSG}"
-              MSG="🔔 *PUSH to ${REF}*
-              Repo: ${REPO}
-              By: ${ACTOR}
-              Message: ${TITLE}
-
-              ▶️ Recent Commits: ${COMMITS_URL}
-              ▶️ Workflow Run: ${RUN_URL}"
-              ;;
-
+          case "$EVENT_KIND" in
             pr)
-              MSG="🧩 *PR to ${PR_BASE:-}*
-              Repo: ${REPO}
-              PR: #${PR_NUM:-} - ${PR_TITLE:-}
-              From: ${PR_HEAD:-} → ${PR_BASE:-}
-              By: ${PR_USER:-}
+              case "$GITHUB_EVENT_NAME" in
+                pull_request|pull_request_target) ;;
+                *) echo "::error::event_kind=pr 은 pull_request 이벤트에서만 호출한다 (현재: $GITHUB_EVENT_NAME)"; exit 1 ;;
+              esac
+              ACTION="$(ev '.action')"
+              case "$ACTION" in
+                opened)           TITLE="PR 열림" ;;
+                reopened)         TITLE="PR 재오픈" ;;
+                ready_for_review) TITLE="PR 리뷰 준비 완료" ;;
+                *) skip "PR action=$ACTION 은 알림 대상이 아니다" ;;
+              esac
+              if [[ "$(ev '.pull_request.draft')" == "true" ]]; then skip "Draft PR"; fi
+              # pull_request 이벤트는 Dependabot·fork PR 에 Secret 을 넘기지 않는다
+              if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+                if [[ "$GITHUB_ACTOR" == "dependabot[bot]" ]]; then skip "Dependabot PR"; fi
+                HEAD_REPO="$(ev '.pull_request.head.repo.full_name')"
+                if [[ -n "$HEAD_REPO" && "$HEAD_REPO" != "$REPO" ]]; then skip "fork PR ($HEAD_REPO)"; fi
+              fi
 
-              ▶️ PR: ${PR_URL:-}
-              ▶️ Workflow Run: ${RUN_URL}"
+              HEADER="🧩 $TITLE"
+              add "레포" "$(esc "${REPO#*/}")"
+              add "제목" "$(link "$(ev '.pull_request.html_url')" "#$(ev '.pull_request.number') $(esc "$(ev '.pull_request.title')")")"
+              add "브랜치" "$(esc "$(ev '.pull_request.head.ref') → $(ev '.pull_request.base.ref')")"
+              add "작성자" "$(esc "$(ev '.pull_request.user.login')")"
+              add "리뷰어" "$(esc "$(jq -r '[(.pull_request.requested_reviewers // [])[].login, (.pull_request.requested_teams // [])[].name] | join(", ")' "$EV")")"
+              add "변경" "커밋 $(ev '.pull_request.commits') · 파일 $(ev '.pull_request.changed_files') · +$(ev '.pull_request.additions') −$(ev '.pull_request.deletions')"
+              add "라벨" "$(esc "$(jq -r '[(.pull_request.labels // [])[].name] | join(", ")' "$EV")")"
               ;;
 
-            merge)
-              MSG="✅ *MERGED into ${PR_BASE:-}*
-              Repo: ${REPO}
-              PR: #${PR_NUM:-} - ${PR_TITLE:-}
-              From: ${PR_HEAD:-} → ${PR_BASE:-}
-              Merged By: ${ACTOR}
+            deploy)
+              case "$IN_RESULT" in
+                success) HEADER="✅ 배포 성공" ;;
+                failure) HEADER="❌ 배포 실패" ;;
+                cancelled|skipped) skip "배포 result=$IN_RESULT" ;;
+                *) echo "::error::result 는 success | failure | cancelled | skipped 중 하나여야 한다 (현재: '${IN_RESULT}')"; exit 1 ;;
+              esac
 
-              ▶️ PR: ${PR_URL:-}
-              ▶️ Workflow Run: ${RUN_URL}"
+              SHA="$GITHUB_SHA"
+              if [[ "$(ev '.pull_request.merged')" == "true" ]]; then SHA="$(ev '.pull_request.merge_commit_sha')"; fi
+              SUBJECT="$(ev '.head_commit.message')"
+              if [[ -z "$SUBJECT" ]]; then
+                SUBJECT="$(api "repos/$REPO/commits/$SHA" --jq '.commit.message')"
+              fi
+              SUBJECT="${SUBJECT%%$'\n'*}"
+              COUNT="$(jq -r '(.commits // []) | length' "$EV")"
+              MORE=""
+              # push 페이로드의 commits 는 20건까지만 담긴다
+              if (( COUNT >= 20 )); then MORE=" 외 $((COUNT - 1))건 이상"
+              elif (( COUNT > 1 )); then MORE=" 외 $((COUNT - 1))건"; fi
+
+              # 실행 시각·실패 단계는 Actions API 로 읽는다 — 호출 job 에 actions: read 가 없으면 두 줄만 빠진다
+              RUN_JSON="$(api "repos/$REPO/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT")"
+              JOBS_JSON="$(api "repos/$REPO/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")"
+              if [[ -z "$RUN_JSON" || -z "$JOBS_JSON" ]]; then
+                echo "::warning::Actions API 를 읽지 못해 소요 시간·실패 단계를 뺀다 — 호출 job 에 permissions: actions: read 를 준다"
+              fi
+
+              DURATION=""
+              STARTED=""
+              if [[ -n "$RUN_JSON" ]]; then STARTED="$(jq -r '.run_started_at // empty' <<< "$RUN_JSON")"; fi
+              if [[ -n "$STARTED" ]]; then
+                SEC=$(( $(date -u +%s) - $(date -u -d "$STARTED" +%s) ))
+                if   (( SEC >= 3600 )); then DURATION="$((SEC / 3600))시간 $((SEC % 3600 / 60))분"
+                elif (( SEC >= 60 ));   then DURATION="$((SEC / 60))분 $((SEC % 60))초"
+                else                         DURATION="${SEC}초"
+                fi
+              fi
+
+              FAILED_STEP=""
+              if [[ "$IN_RESULT" == "failure" && -n "$JOBS_JSON" ]]; then
+                FAILED_STEP="$(jq -r '
+                  [(.jobs // [])[] | select(.conclusion == "failure")][0] // empty
+                  | .name + ([(.steps // [])[] | select(.conclusion == "failure")][0] | if . then " › " + .name else "" end)
+                ' <<< "$JOBS_JSON")"
+              fi
+
+              NOTE=()
+              if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then NOTE+=("수동 실행"); fi
+              if (( GITHUB_RUN_ATTEMPT > 1 )); then NOTE+=("재실행 ${GITHUB_RUN_ATTEMPT}회차"); fi
+              BY="${GITHUB_TRIGGERING_ACTOR:-$GITHUB_ACTOR}"
+              if (( ${#NOTE[@]} )); then
+                J="${NOTE[0]}"; for n in "${NOTE[@]:1}"; do J+=" · $n"; done
+                BY="$BY ($J)"
+              fi
+
+              add "레포" "$(esc "${REPO#*/}")"
+              add "프로젝트" "$(esc "$IN_PROJECT")"
+              add "환경" "$(esc "$IN_ENV")"
+              BRANCH="$(ev '.pull_request.base.ref')"
+              add "브랜치" "$(esc "${BRANCH:-$GITHUB_REF_NAME}")"
+              add "커밋" "$(link "$SERVER/$REPO/commit/$SHA" "${SHA:0:7}")${SUBJECT:+ $(esc "$SUBJECT")}$MORE"
+              add "메시지" "$(esc "$IN_MESSAGE")"
+              add "태그" "$(esc "$IN_TAG")"
+              add "실패 단계" "$(esc "$FAILED_STEP")"
+              add "실행자" "$(esc "$BY")"
+              add "소요 시간" "$DURATION"
+              add "실행 로그" "$(link "$SERVER/$REPO/actions/runs/$GITHUB_RUN_ID" "$(esc "$GITHUB_WORKFLOW") #$GITHUB_RUN_NUMBER")"
+              if [[ -n "$IN_URL" ]]; then add "서비스" "$(link "$IN_URL" "$(esc "$IN_URL")")"; fi
               ;;
 
             *)
-              MSG="ℹ️ Unsupported event_kind: ${EVENT}
-              Repo: ${REPO}
-              ▶️ Workflow Run: ${RUN_URL}"
+              echo "::error::event_kind 는 pr | deploy 중 하나여야 한다 (현재: '${EVENT_KIND}')"
+              exit 1
               ;;
           esac
 
+          TEXT="<b>$(esc "$HEADER")</b>"
+          for l in "${LINES[@]}"; do TEXT+=$'\n'"$l"; done
+
+          DELIM="EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
           {
-            printf 'text<<EOF\n'
-            printf '%s\n' "$MSG"
-            printf 'EOF\n'
+            echo "text<<$DELIM"
+            printf '%s\n' "$TEXT"
+            echo "$DELIM"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Decide chat target by event_kind
-        id: route
+      - name: Send Telegram
+        if: steps.msg.outputs.skip != 'true'
         shell: bash
+        env:
+          EVENT_KIND: ${{ inputs.event_kind }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TO_PR: ${{ secrets.TELEGRAM_TO_PR }}
+          TO_DEPLOY: ${{ secrets.TELEGRAM_TO_DEPLOY }}
+          TEXT: ${{ steps.msg.outputs.text }}
         run: |
           set -euo pipefail
-          EVENT="${{ inputs.event_kind }}"
-          TO_DEFAULT="${{ secrets.TELEGRAM_TO }}"
-          case "$EVENT" in
-          push)   TO="${{ secrets.TELEGRAM_TO_PUSH }}"   ;;
-          pr)     TO="${{ secrets.TELEGRAM_TO_PR }}"     ;;
-          merge)  TO="${{ secrets.TELEGRAM_TO_MERGE }}"  ;;
-          deploy) TO="${{ secrets.TELEGRAM_TO_DEPLOY }}" ;;
-          *)      TO="" ;;
 
+          case "$EVENT_KIND" in
+            pr)     CHAT_ID="$TO_PR";     HINT="레포 Secret TELEGRAM_TO_PR 에 이 레포의 PR 방 id 를 등록한다" ;;
+            deploy) CHAT_ID="$TO_DEPLOY"; HINT="조직 Secret TELEGRAM_TO_DEPLOY 의 Repository access 에 이 레포를 추가한다" ;;
           esac
-          [[ -z "${TO:-}" ]] && TO="$TO_DEFAULT"
-          echo "to=$TO" >> "$GITHUB_OUTPUT"
+          # 방을 못 찾으면 다른 방으로 대신 보내지 않고 실패시킨다 — PR 방은 레포마다 다르다
+          if [[ -z "$BOT_TOKEN" ]]; then echo "::error::Secret TELEGRAM_TOKEN 이 비어 있다 — 조직 Secret 의 Repository access 에 이 레포를 추가한다"; exit 1; fi
+          if [[ -z "$CHAT_ID" ]];   then echo "::error::채팅방 Secret 이 비어 있다 — $HINT"; exit 1; fi
 
-      - name: Send Telegram
-        uses: 5n-project/github-actions-module/actions/notify-telegram@v1
-        with:
-          bot_token: ${{ secrets.TELEGRAM_TOKEN }}
-          chat_id: ${{ steps.route.outputs.to }}
-          message: ${{ steps.msg.outputs.text }}
+          if ! RESP="$(curl -sS --fail-with-body --retry 3 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${CHAT_ID}" \
+                --data-urlencode "parse_mode=HTML" \
+                --data-urlencode 'link_preview_options={"is_disabled":true}' \
+                --data-urlencode "text=${TEXT}")"; then
+            echo "::error::텔레그램 전송 실패: $RESP"
+            exit 1
+          fi
+          echo "전송 완료 (message_id=$(jq -r '.result.message_id' <<< "$RESP"))"
