@@ -94,8 +94,11 @@ jobs:
               fi
 
               MSG="${ICON} *DEPLOY ${RESULT_UPPER}*
+              Repo:    ${REPO#*/}
               Project: ${IN_PROJECT:-}
               Env:     ${IN_ENV:-}
+              Branch:  ${PR_BASE:-$REF}
+              By:      ${ACTOR}
               Message: ${MESSAGE}
 
               ▶️ Workflow Run: ${RUN_URL}"
