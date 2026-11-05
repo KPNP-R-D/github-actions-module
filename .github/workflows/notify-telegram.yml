@@ -74,8 +74,17 @@ jobs:
           # 한 줄에 「항목: 값」 하나 — 입력값은 첫 줄만 쓴다
           for v in IN_PROJECT IN_ENV IN_MESSAGE IN_TAG IN_URL; do printf -v "$v" '%s' "${!v%%$'\n'*}"; done
 
-          LINES=()
-          add() { if [[ -n "${2-}" ]]; then LINES+=("$1: $2"); fi; }
+          # 머리말 바로 아래가 핵심 묶음, 그 뒤는 굵은 소제목으로 묶는다. 빈 묶음은 소제목째 뺀다
+          BODY=""; SECTION=""; CUR=()
+          flush() {
+            if (( ${#CUR[@]} )); then
+              if [[ -n "$SECTION" ]]; then BODY+=$'\n\n'"<b>$SECTION</b>"; fi
+              for l in "${CUR[@]}"; do BODY+=$'\n'"$l"; done
+            fi
+            CUR=()
+          }
+          section() { flush; SECTION="$1"; }
+          add() { if [[ -n "${2-}" ]]; then CUR+=("$1: $2"); fi; }
 
           case "$EVENT_KIND" in
             pr)
@@ -101,8 +110,9 @@ jobs:
               HEADER="🧩 $TITLE"
               add "레포" "$(esc "${REPO#*/}")"
               add "제목" "$(link "$(ev '.pull_request.html_url')" "#$(ev '.pull_request.number') $(esc "$(ev '.pull_request.title')")")"
-              add "브랜치" "$(esc "$(ev '.pull_request.head.ref') → $(ev '.pull_request.base.ref')")"
               add "작성자" "$(esc "$(ev '.pull_request.user.login')")"
+              add "브랜치" "$(esc "$(ev '.pull_request.head.ref') → $(ev '.pull_request.base.ref')")"
+              section "상세"
               add "리뷰어" "$(esc "$(jq -r '[(.pull_request.requested_reviewers // [])[].login, (.pull_request.requested_teams // [])[].name] | join(", ")' "$EV")")"
               add "변경" "커밋 $(ev '.pull_request.commits') · 파일 $(ev '.pull_request.changed_files') · +$(ev '.pull_request.additions') −$(ev '.pull_request.deletions')"
               add "라벨" "$(esc "$(jq -r '[(.pull_request.labels // [])[].name] | join(", ")' "$EV")")"
@@ -169,10 +179,12 @@ jobs:
               add "환경" "$(esc "$IN_ENV")"
               BRANCH="$(ev '.pull_request.base.ref')"
               add "브랜치" "$(esc "${BRANCH:-$GITHUB_REF_NAME}")"
+              add "실패 단계" "$(esc "$FAILED_STEP")"
+              section "변경 내용"
               add "커밋" "$(link "$SERVER/$REPO/commit/$SHA" "${SHA:0:7}")${SUBJECT:+ $(esc "$SUBJECT")}$MORE"
               add "메시지" "$(esc "$IN_MESSAGE")"
               add "태그" "$(esc "$IN_TAG")"
-              add "실패 단계" "$(esc "$FAILED_STEP")"
+              section "실행 정보"
               add "실행자" "$(esc "$BY")"
               add "소요 시간" "$DURATION"
               add "실행 로그" "$(link "$SERVER/$REPO/actions/runs/$GITHUB_RUN_ID" "$(esc "$GITHUB_WORKFLOW") #$GITHUB_RUN_NUMBER")"
@@ -185,8 +197,8 @@ jobs:
               ;;
           esac
 
-          TEXT="<b>$(esc "$HEADER")</b>"
-          for l in "${LINES[@]}"; do TEXT+=$'\n'"$l"; done
+          flush
+          TEXT="<b>$(esc "$HEADER")</b>$BODY"
 
           DELIM="EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
           {
