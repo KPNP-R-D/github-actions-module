@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       project:
-        description: "프로젝트/서비스명 (deploy)"
+        description: "프로젝트/서비스명"
         required: false
         type: string
       environment:
@@ -107,9 +107,24 @@ jobs:
                 if [[ -n "$HEAD_REPO" && "$HEAD_REPO" != "$REPO" ]]; then skip "fork PR ($HEAD_REPO)"; fi
               fi
 
+              # 본문 「## 👀 리뷰」 절의 첫 값 줄(안내 인용·HTML 주석·빈 줄 제외). 절이 있는데 값이 필요·불필요가 아니면 미기재
+              # awk 는 입력을 끝까지 읽는다 — 중간에 exit 하면 앞 단계가 SIGPIPE 로 죽고 pipefail 이 step 을 실패시킨다
+              REVIEW="$(jq -r '.pull_request.body // ""' "$EV" | tr -d '\r' | awk '
+                d { next }
+                /^##[[:space:]]/ { if (f) d = 1; else if ($0 ~ /^##[[:space:]]*👀[[:space:]]*리뷰[[:space:]]*$/) f = 1; next }
+                f && /^[[:space:]]*(>.*|<!--.*)?$/ { next }
+                f { v = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); d = 1 }
+                END { if (f) print (v == "" ? "?" : v) }')"
+              case "$REVIEW" in
+                ""|필요|불필요) ;;
+                *) REVIEW="미기재" ;;
+              esac
+
               HEADER="🧩 $TITLE"
               add "레포" "$(esc "${REPO#*/}")"
+              add "프로젝트" "$(esc "$IN_PROJECT")"
               add "제목" "$(link "$(ev '.pull_request.html_url')" "#$(ev '.pull_request.number') $(esc "$(ev '.pull_request.title')")")"
+              add "리뷰" "$REVIEW"
               add "작성자" "$(esc "$(ev '.pull_request.user.login')")"
               add "브랜치" "$(esc "$(ev '.pull_request.head.ref') → $(ev '.pull_request.base.ref')")"
               section "상세"

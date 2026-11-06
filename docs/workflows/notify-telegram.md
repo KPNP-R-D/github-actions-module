@@ -21,8 +21,10 @@ uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
 
 ```
 🧩 PR 열림                       ← PR 재오픈 / PR 리뷰 준비 완료
-레포: KPNP-Champs-Front
+레포: KPNP-Web
+프로젝트: kpnp-champs              (inputs.project)
 제목: #123 [fix] 품새 - …         (PR 링크)
+리뷰: 필요                        (본문 「## 👀 리뷰」 절 — 아래)
 작성자: jw
 브랜치: fix/referee → dev
 
@@ -30,6 +32,15 @@ uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
 리뷰어: mandykr, front           (이벤트 시점의 requested_reviewers · requested_teams)
 변경: 커밋 3 · 파일 5 · +120 −30
 라벨: bug, frontend
+```
+
+「리뷰」 줄은 PR 본문에서 읽는다. 제목이 `👀 리뷰` 인 `##` 절의 첫 값 줄(`>` 안내 인용·`<!--` 주석·빈 줄 제외)이 `필요` · `불필요` 면 그대로, 다른 값이거나 비었으면 `미기재` 로 적는다. 그 절이 없는 PR 은 줄째 빠진다.
+
+```markdown
+## 👀 리뷰
+> 필요 / 불필요 중 하나만 남겨주세요.
+
+필요
 ```
 
 ### 배포
@@ -79,7 +90,7 @@ uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
 |---|---|---|
 | `event_kind` | 공통 · 필수 | `pr` \| `deploy` |
 | `result` | deploy · 필수 | `success` \| `failure` \| `cancelled` \| `skipped` |
-| `project` | deploy | 프로젝트/서비스명 |
+| `project` | 공통 | 프로젝트/서비스명 — 한 레포에 여러 서비스가 있으면 호출 레포가 변경 경로에서 뽑아 넘긴다 |
 | `environment` | deploy | `dev` · `stg` · `prod` 등 |
 | `message` | deploy | 배포 메모 (첫 줄만 쓴다) |
 | `tag` | deploy | 배포한 태그 |
@@ -126,6 +137,7 @@ jobs:
     uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
     with:
       event_kind: pr
+      # project: kpnp-champs   (선택 — 모노레포는 변경 경로에서 뽑아 넘긴다. 예: KPNP-Web .github/workflows/notify-pr.yml 의 detect job)
     secrets: inherit
 ```
 
