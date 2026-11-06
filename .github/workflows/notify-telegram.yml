@@ -120,19 +120,21 @@ jobs:
               esac
 
               HEADER="🧩 $TITLE"
-              add "레포" "$(esc "${REPO#*/}")"
-              add "프로젝트" "$(esc "$IN_PROJECT")"
-              # PR 번호 줄은 줄 전체 굵게 (값은 정수라 이스케이프 불필요)
-              CUR+=("<b>PR: #$(ev '.pull_request.number')</b>")
-              add "제목" "$(esc "$(ev '.pull_request.title')")"
-              # 리뷰 줄만 눈에 띄게 — 값별 이모지 + 줄 전체 굵게 (값은 필요·불필요·미정·미기재 고정어라 이스케이프 불필요)
+              # 리뷰 줄만 눈에 띄게 — 머리말 바로 아래 · 값별 이모지 + 줄 전체 굵게 (값은 필요·불필요·미정·미기재 고정어라 이스케이프 불필요)
               case "$REVIEW" in
                 필요)   REVIEW_ICON="🔴" ;;
                 불필요) REVIEW_ICON="🟢" ;;
                 미정)   REVIEW_ICON="🟡" ;;
                 *)      REVIEW_ICON="⚪" ;;
               esac
-              if [[ -n "$REVIEW" ]]; then CUR+=("$REVIEW_ICON <b>리뷰: $REVIEW</b>"); fi
+              # 빈 문자열 원소는 빈 줄이 된다
+              if [[ -n "$REVIEW" ]]; then CUR+=("$REVIEW_ICON <b>리뷰: $REVIEW</b>" ""); fi
+              add "레포" "$(esc "${REPO#*/}")"
+              add "프로젝트" "$(esc "$IN_PROJECT")"
+              # PR 번호 줄은 줄 전체 굵게 (값은 정수라 이스케이프 불필요)
+              CUR+=("<b>PR: #$(ev '.pull_request.number')</b>" "")
+              add "제목" "$(esc "$(ev '.pull_request.title')")"
+              CUR+=("")
               add "작성자" "$(esc "$(ev '.pull_request.user.login')")"
               add "브랜치" "$(esc "$(ev '.pull_request.head.ref') → $(ev '.pull_request.base.ref')")"
               # 링크는 <a> 로 감싸지 않고 URL 그대로 둔다 — 글자와 주소가 다른 링크는 텔레그램이 열기 확인창을 띄운다
