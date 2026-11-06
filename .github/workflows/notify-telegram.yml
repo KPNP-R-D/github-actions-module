@@ -106,7 +106,7 @@ jobs:
                 if [[ -n "$HEAD_REPO" && "$HEAD_REPO" != "$REPO" ]]; then skip "fork PR ($HEAD_REPO)"; fi
               fi
 
-              # 본문 「## 👀 리뷰」 절의 첫 값 줄(안내 인용·HTML 주석·빈 줄 제외). 절이 있는데 값이 필요·불필요가 아니면 미기재
+              # 본문 「## 👀 리뷰」 절의 첫 값 줄(안내 인용·HTML 주석·빈 줄 제외). 절이 있는데 값이 필요·불필요·미정이 아니면 미기재
               # awk 는 입력을 끝까지 읽는다 — 중간에 exit 하면 앞 단계가 SIGPIPE 로 죽고 pipefail 이 step 을 실패시킨다
               REVIEW="$(jq -r '.pull_request.body // ""' "$EV" | tr -d '\r' | awk '
                 d { next }
@@ -115,7 +115,7 @@ jobs:
                 f { v = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); d = 1 }
                 END { if (f) print (v == "" ? "?" : v) }')"
               case "$REVIEW" in
-                ""|필요|불필요) ;;
+                ""|필요|불필요|미정) ;;
                 *) REVIEW="미기재" ;;
               esac
 
@@ -125,10 +125,11 @@ jobs:
               # PR 번호 줄은 줄 전체 굵게 (값은 정수라 이스케이프 불필요)
               CUR+=("<b>PR: #$(ev '.pull_request.number')</b>")
               add "제목" "$(esc "$(ev '.pull_request.title')")"
-              # 리뷰 줄만 눈에 띄게 — 값별 이모지 + 줄 전체 굵게 (값은 필요·불필요·미기재 고정어라 이스케이프 불필요)
+              # 리뷰 줄만 눈에 띄게 — 값별 이모지 + 줄 전체 굵게 (값은 필요·불필요·미정·미기재 고정어라 이스케이프 불필요)
               case "$REVIEW" in
                 필요)   REVIEW_ICON="🔴" ;;
                 불필요) REVIEW_ICON="🟢" ;;
+                미정)   REVIEW_ICON="🟡" ;;
                 *)      REVIEW_ICON="⚪" ;;
               esac
               if [[ -n "$REVIEW" ]]; then CUR+=("$REVIEW_ICON <b>리뷰: $REVIEW</b>"); fi
