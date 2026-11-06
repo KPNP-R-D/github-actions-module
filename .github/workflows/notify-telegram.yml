@@ -65,7 +65,6 @@ jobs:
           SERVER="${GITHUB_SERVER_URL:-https://github.com}"
 
           esc() { printf '%s' "${1-}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
-          link() { printf '<a href="%s">%s</a>' "$(esc "$1")" "$2"; }
           ev() { jq -r "$1 // empty" "$EV"; }
           skip() { echo "::notice::$1 — 알림을 보내지 않는다"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
           # gh api 는 HTTP 오류에도 응답 본문을 stdout 에 낸다 — 성공했을 때만 본문을 돌려준다
@@ -123,10 +122,12 @@ jobs:
               HEADER="🧩 $TITLE"
               add "레포" "$(esc "${REPO#*/}")"
               add "프로젝트" "$(esc "$IN_PROJECT")"
-              add "제목" "$(link "$(ev '.pull_request.html_url')" "#$(ev '.pull_request.number') $(esc "$(ev '.pull_request.title')")")"
+              add "제목" "$(esc "#$(ev '.pull_request.number') $(ev '.pull_request.title')")"
               add "리뷰" "$REVIEW"
               add "작성자" "$(esc "$(ev '.pull_request.user.login')")"
               add "브랜치" "$(esc "$(ev '.pull_request.head.ref') → $(ev '.pull_request.base.ref')")"
+              # 링크는 <a> 로 감싸지 않고 URL 그대로 둔다 — 글자와 주소가 다른 링크는 텔레그램이 열기 확인창을 띄운다
+              add "링크" "$(esc "$(ev '.pull_request.html_url')")"
               section "상세"
               add "리뷰어" "$(esc "$(jq -r '[(.pull_request.requested_reviewers // [])[].login, (.pull_request.requested_teams // [])[].name] | join(", ")' "$EV")")"
               add "변경" "커밋 $(ev '.pull_request.commits') · 파일 $(ev '.pull_request.changed_files') · +$(ev '.pull_request.additions') −$(ev '.pull_request.deletions')"
@@ -196,14 +197,14 @@ jobs:
               add "브랜치" "$(esc "${BRANCH:-$GITHUB_REF_NAME}")"
               add "실패 단계" "$(esc "$FAILED_STEP")"
               section "변경 내용"
-              add "커밋" "$(link "$SERVER/$REPO/commit/$SHA" "${SHA:0:7}")${SUBJECT:+ $(esc "$SUBJECT")}$MORE"
+              add "커밋" "${SHA:0:7}${SUBJECT:+ $(esc "$SUBJECT")}$MORE"
               add "메시지" "$(esc "$IN_MESSAGE")"
               add "태그" "$(esc "$IN_TAG")"
               section "실행 정보"
               add "실행자" "$(esc "$BY")"
               add "소요 시간" "$DURATION"
-              add "실행 로그" "$(link "$SERVER/$REPO/actions/runs/$GITHUB_RUN_ID" "$(esc "$GITHUB_WORKFLOW") #$GITHUB_RUN_NUMBER")"
-              if [[ -n "$IN_URL" ]]; then add "서비스" "$(link "$IN_URL" "$(esc "$IN_URL")")"; fi
+              add "실행 로그" "$(esc "$SERVER/$REPO/actions/runs/$GITHUB_RUN_ID")"
+              add "서비스" "$(esc "$IN_URL")"
               ;;
 
             *)

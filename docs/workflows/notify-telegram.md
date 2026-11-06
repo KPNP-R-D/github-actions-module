@@ -16,6 +16,7 @@ uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
 - 첫 줄은 굵은 머리말이고 그 바로 아래가 **핵심 묶음**이다. 부가 정보는 빈 줄 뒤 **굵은 소제목**으로 묶는다.
 - 소제목 줄을 뺀 모든 줄은 `항목: 값` 이다. 값이 없는 항목은 줄째, 항목이 하나도 없는 묶음은 소제목째 빠진다.
 - `parse_mode=HTML` 로 보내고 모든 값은 HTML 이스케이프한다. 링크 미리보기는 끈다.
+- 링크는 `<a>` 로 감싸지 않고 URL 을 값으로 그대로 적는다 — 텔레그램은 보이는 글자와 주소가 다른 링크에 열기 확인창을 띄운다.
 
 ### PR
 
@@ -23,10 +24,11 @@ uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
 🧩 PR 열림                       ← PR 재오픈 / PR 리뷰 준비 완료
 레포: KPNP-Web
 프로젝트: kpnp-champs              (inputs.project)
-제목: #123 [fix] 품새 - …         (PR 링크)
+제목: #123 [fix] 품새 - …
 리뷰: 필요                        (본문 「## 👀 리뷰」 절 — 아래)
 작성자: jw
 브랜치: fix/referee → dev
+링크: https://github.com/KPNP-R-D/KPNP-Web/pull/123
 
 상세                              (굵은 소제목)
 리뷰어: mandykr, front           (이벤트 시점의 requested_reviewers · requested_teams)
@@ -54,14 +56,14 @@ uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
 실패 단계: deploy › 기동 확인       (실패일 때 · 처음 실패한 job › step)
 
 변경 내용                         (굵은 소제목)
-커밋: 9ab47c8 [docs] CI - … 외 2건 (커밋 링크 · push 에 묶인 커밋 수 · 20건부터 「이상」)
+커밋: 9ab47c8 [docs] CI - … 외 2건 (push 에 묶인 커밋 수 · 20건부터 「이상」)
 메시지: 긴급 패치                  (inputs.message 첫 줄)
 태그: kpnp-champs/v1.2.3          (inputs.tag)
 
 실행 정보                         (굵은 소제목)
 실행자: mandykr (수동 실행 · 재실행 2회차)
 소요 시간: 4분 42초               (실행 시작부터 알림까지)
-실행 로그: deploy-champs-front-dev #57 (실행 링크)
+실행 로그: https://github.com/KPNP-R-D/KPNP-Champs-Front/actions/runs/123456789
 서비스: https://dev.example.com    (inputs.url)
 ```
 
