@@ -122,7 +122,9 @@ jobs:
               HEADER="🧩 $TITLE"
               add "레포" "$(esc "${REPO#*/}")"
               add "프로젝트" "$(esc "$IN_PROJECT")"
-              add "제목" "$(esc "#$(ev '.pull_request.number') $(ev '.pull_request.title')")"
+              # PR 번호 줄은 줄 전체 굵게 (값은 정수라 이스케이프 불필요)
+              CUR+=("<b>PR: #$(ev '.pull_request.number')</b>")
+              add "제목" "$(esc "$(ev '.pull_request.title')")"
               # 리뷰 줄만 눈에 띄게 — 값별 이모지 + 줄 전체 굵게 (값은 필요·불필요·미기재 고정어라 이스케이프 불필요)
               case "$REVIEW" in
                 필요)   REVIEW_ICON="🔴" ;;
