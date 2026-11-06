@@ -56,7 +56,7 @@ uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
 실패 단계: deploy › 기동 확인       (실패일 때 · 처음 실패한 job › step)
 
 변경 내용                         (굵은 소제목)
-커밋: 9ab47c8 [docs] CI - … 외 2건 (push 에 묶인 커밋 수 · 20건부터 「이상」)
+커밋: [docs] CI - … 외 2건 (push 에 묶인 커밋 수 · 20건부터 「이상」)
 메시지: 긴급 패치                  (inputs.message 첫 줄)
 태그: kpnp-champs/v1.2.3          (inputs.tag)
 
@@ -119,7 +119,7 @@ uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
 | 권한 | 없으면 |
 |---|---|
 | `actions: read` | 배포 알림에서 「소요 시간」·「실패 단계」 줄이 빠진다 (경고만 남기고 전송은 한다) |
-| `contents: read` | push 가 아닌 배포(수동 실행 등)에서 커밋 제목이 빠진다 |
+| `contents: read` | push 가 아닌 배포(수동 실행 등)에서 「커밋」 줄이 빠진다 |
 
 ---
 

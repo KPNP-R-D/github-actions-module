@@ -197,7 +197,7 @@ jobs:
               add "브랜치" "$(esc "${BRANCH:-$GITHUB_REF_NAME}")"
               add "실패 단계" "$(esc "$FAILED_STEP")"
               section "변경 내용"
-              add "커밋" "${SHA:0:7}${SUBJECT:+ $(esc "$SUBJECT")}$MORE"
+              add "커밋" "${SUBJECT:+$(esc "$SUBJECT")$MORE}"
               add "메시지" "$(esc "$IN_MESSAGE")"
               add "태그" "$(esc "$IN_TAG")"
               section "실행 정보"
