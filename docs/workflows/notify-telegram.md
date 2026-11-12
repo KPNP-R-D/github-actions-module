@@ -1,6 +1,6 @@
 # Reusable Notify (Telegram) — v2
 
-PR·배포 알림을 **전 레포 공통 서식**으로 텔레그램에 보낸다. 호출 레포는 "언제 보낼지"만 정하고, 메시지 내용은 이 모듈이 GitHub 이벤트와 Actions API 에서 채운다.
+PR·리뷰·배포 알림을 **전 레포 공통 서식**으로 텔레그램에 보낸다. 호출 레포는 "언제 보낼지"만 정하고, 메시지 내용은 이 모듈이 GitHub 이벤트와 Actions API 에서 채운다.
 
 ```yaml
 uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
@@ -12,9 +12,9 @@ uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
 
 ## 메시지 서식
 
-- 이모지는 🧩(PR) ✅(배포 성공) ❌(배포 실패) 머리말 셋과 PR 「리뷰」 줄의 🔴(필요) 🟢(불필요) 🟡(미정) ⚪(미기재)만 쓴다.
+- 이모지는 🧩(PR) ✅(배포 성공 · 리뷰 승인) ❌(배포 실패) 🔴(리뷰 변경 요청) 머리말과 PR 「리뷰」 줄의 🔴(필요) 🟢(불필요) 🟡(미정) ⚪(미기재)만 쓴다.
 - 첫 줄은 굵은 머리말이고 그 바로 아래가 **핵심 묶음**이다(PR 은 핵심 묶음 안을 빈 줄로 리뷰 / 레포·프로젝트·PR / 제목 / 작성자·브랜치·링크로 나눈다). 부가 정보는 빈 줄 뒤 **굵은 소제목**으로 묶는다.
-- 소제목 줄을 뺀 모든 줄은 `항목: 값` 이다(PR 「PR」 번호 줄은 줄 전체를 굵게 하고, 「리뷰」 줄은 값별 이모지를 앞에 붙이고 줄 전체를 굵게 한다). 값이 없는 항목은 줄째, 항목이 하나도 없는 묶음은 소제목째 빠진다.
+- 소제목 줄을 뺀 모든 줄은 `항목: 값` 이다(PR 「PR」 번호 줄은 줄 전체를 굵게 하고, 「리뷰」 줄은 값별 이모지를 앞에 붙이고 줄 전체를 굵게 한다). 값이 없는 항목은 줄째, 항목이 하나도 없는 묶음은 소제목째 빠진다. 리뷰 알림만 예외다(아래).
 - `parse_mode=HTML` 로 보내고 모든 값은 HTML 이스케이프한다. 링크 미리보기는 끈다.
 - 링크는 `<a>` 로 감싸지 않고 URL 을 값으로 그대로 적는다 — 텔레그램은 보이는 글자와 주소가 다른 링크에 열기 확인창을 띄운다.
 
@@ -49,6 +49,17 @@ PR: #123                         (굵게)
 필요
 ```
 
+### 리뷰
+
+PR 리뷰가 제출될 때마다(리뷰어별·회차별) 한 건씩 보낸다. 다른 알림과 달리 `항목: 값` 줄이 없다 — 머리말 아래는 「리뷰어 → 리뷰이」 줄과 링크 줄뿐이다.
+
+```
+✅ #412 리뷰 승인                 ← 🔴 #412 리뷰 변경 요청
+alice → mandykr                  (리뷰어 → PR 작성자)
+
+https://github.com/KPNP-R-D/KPNP-Web/pull/412#pullrequestreview-123456   (그 리뷰로 바로 가는 주소)
+```
+
 ### 배포
 
 ```
@@ -78,12 +89,14 @@ PR: #123                         (굵게)
 | event_kind | 호출 이벤트 | 보냄 | 보내지 않음 (job 은 성공) |
 |---|---|---|---|
 | `pr` | `pull_request` · `pull_request_target` | `opened` · `reopened` · `ready_for_review` | Draft PR, 그 밖의 action(`synchronize` 등), `pull_request` 이벤트의 Dependabot·fork PR (Secret 이 넘어오지 않는다) |
+| `review` | `pull_request_review` | `submitted` 이고 state 가 `approved` · `changes_requested` | `commented`(인라인 코멘트 답글도 이것이 된다), `submitted` 가 아닌 action, fork PR |
 | `deploy` | 아무 이벤트 | `result` = `success` · `failure` | `result` = `cancelled` · `skipped` |
 
 실패로 끝나는 경우 — 잘못 호출했거나 설정이 빠졌다는 뜻이다.
 
-- `event_kind` 가 `pr` · `deploy` 가 아니다
+- `event_kind` 가 `pr` · `review` · `deploy` 가 아니다
 - `event_kind: pr` 를 pull_request 가 아닌 이벤트에서 호출했다
+- `event_kind: review` 를 pull_request_review 가 아닌 이벤트에서 호출했다
 - `deploy` 의 `result` 가 비었거나 위 네 값이 아니다
 - `TELEGRAM_TOKEN` 또는 대상 채팅방 Secret 이 비어 있다 — **다른 방으로 대신 보내지 않는다**
 - 텔레그램 API 가 오류를 돌려줬다 (응답 본문을 로그에 남긴다)
@@ -94,7 +107,7 @@ PR: #123                         (굵게)
 
 | Input | 대상 | 설명 |
 |---|---|---|
-| `event_kind` | 공통 · 필수 | `pr` \| `deploy` |
+| `event_kind` | 공통 · 필수 | `pr` \| `review` \| `deploy` |
 | `result` | deploy · 필수 | `success` \| `failure` \| `cancelled` \| `skipped` |
 | `project` | 공통 | 프로젝트/서비스명 — 한 레포에 여러 서비스가 있으면 호출 레포가 변경 경로에서 뽑아 넘긴다 |
 | `environment` | deploy | `dev` · `stg` · `prod` 등 |
@@ -109,7 +122,7 @@ PR: #123                         (굵게)
 | Secret | 쓰는 곳 | 범위 |
 |---|---|---|
 | `TELEGRAM_TOKEN` | 공통 | 조직 Secret (KPNP_Notifier_bot) |
-| `TELEGRAM_TO_PR` | pr | **레포 Secret** — PR 방은 레포마다 다르다 |
+| `TELEGRAM_TO_PR` | pr · review | **레포 Secret** — PR 방은 레포마다 다르다 |
 | `TELEGRAM_TO_DEPLOY` | deploy | 조직 Secret (「배포」 방) |
 
 봇이 대상 채팅방에 들어가 있어야 한다. 조직 Secret 은 Repository access 에 호출 레포가 포함돼야 한다.
@@ -144,6 +157,25 @@ jobs:
     with:
       event_kind: pr
       # project: kpnp-champs   (선택 — 모노레포는 변경 경로에서 뽑아 넘긴다. 예: KPNP-Web .github/workflows/notify-pr.yml 의 detect job)
+    secrets: inherit
+```
+
+### 리뷰 알림 — `.github/workflows/notify-review.yml`
+
+```yaml
+name: Notify Review
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  notify:
+    # 보내지 않을 리뷰(commented 등)는 러너를 띄우기 전에 거른다 — 모듈도 같은 조건으로 한 번 더 거른다
+    if: github.event.review.state == 'approved' || github.event.review.state == 'changes_requested'
+    uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
+    with:
+      event_kind: review
     secrets: inherit
 ```
 

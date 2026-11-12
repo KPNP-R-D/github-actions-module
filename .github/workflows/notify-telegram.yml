@@ -1,11 +1,11 @@
 name: Reusable Notify
 
-# v2 — PR·배포 알림을 전 레포 공통 서식(HTML)으로 보낸다. 서식과 호출 계약은 docs/workflows/notify-telegram.md
+# v2 — PR·리뷰·배포 알림을 전 레포 공통 서식(HTML)으로 보낸다. 서식과 호출 계약은 docs/workflows/notify-telegram.md
 on:
   workflow_call:
     inputs:
       event_kind:
-        description: "pr | deploy"
+        description: "pr | review | deploy"
         required: true
         type: string
       project:
@@ -145,6 +145,28 @@ jobs:
               add "라벨" "$(esc "$(jq -r '[(.pull_request.labels // [])[].name] | join(", ")' "$EV")")"
               ;;
 
+            review)
+              if [[ "$GITHUB_EVENT_NAME" != "pull_request_review" ]]; then
+                echo "::error::event_kind=review 는 pull_request_review 이벤트에서만 호출한다 (현재: $GITHUB_EVENT_NAME)"; exit 1
+              fi
+              ACTION="$(ev '.action')"
+              if [[ "$ACTION" != "submitted" ]]; then skip "리뷰 action=$ACTION 은 알림 대상이 아니다"; fi
+              # 웹훅 페이로드의 state 는 소문자지만 REST 응답은 대문자다 — 소문자로 맞춰 비교한다
+              STATE="$(jq -r '(.review.state // "") | ascii_downcase' "$EV")"
+              case "$STATE" in
+                approved)          HEADER="✅ #$(ev '.pull_request.number') 리뷰 승인" ;;
+                changes_requested) HEADER="🔴 #$(ev '.pull_request.number') 리뷰 변경 요청" ;;
+                *) skip "리뷰 state=$STATE 는 알림 대상이 아니다" ;;
+              esac
+              # pull_request_review 이벤트도 fork PR 에는 Secret 을 넘기지 않는다
+              HEAD_REPO="$(ev '.pull_request.head.repo.full_name')"
+              if [[ -n "$HEAD_REPO" && "$HEAD_REPO" != "$REPO" ]]; then skip "fork PR ($HEAD_REPO)"; fi
+
+              # 「항목: 값」 이 아닌 두 줄 — 리뷰어 → 리뷰이, 그리고 리뷰로 바로 가는 링크
+              CUR+=("$(esc "$(ev '.review.user.login')") → $(esc "$(ev '.pull_request.user.login')")" "")
+              CUR+=("$(esc "$(ev '.review.html_url')")")
+              ;;
+
             deploy)
               case "$IN_RESULT" in
                 success) HEADER="✅ 배포 성공" ;;
@@ -219,7 +241,7 @@ jobs:
               ;;
 
             *)
-              echo "::error::event_kind 는 pr | deploy 중 하나여야 한다 (현재: '${EVENT_KIND}')"
+              echo "::error::event_kind 는 pr | review | deploy 중 하나여야 한다 (현재: '${EVENT_KIND}')"
               exit 1
               ;;
           esac
@@ -247,7 +269,7 @@ jobs:
           set -euo pipefail
 
           case "$EVENT_KIND" in
-            pr)     CHAT_ID="$TO_PR";     HINT="레포 Secret TELEGRAM_TO_PR 에 이 레포의 PR 방 id 를 등록한다" ;;
+            pr|review) CHAT_ID="$TO_PR";  HINT="레포 Secret TELEGRAM_TO_PR 에 이 레포의 PR 방 id 를 등록한다" ;;
             deploy) CHAT_ID="$TO_DEPLOY"; HINT="조직 Secret TELEGRAM_TO_DEPLOY 의 Repository access 에 이 레포를 추가한다" ;;
           esac
           # 방을 못 찾으면 다른 방으로 대신 보내지 않고 실패시킨다 — PR 방은 레포마다 다르다
