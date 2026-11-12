@@ -12,7 +12,7 @@ uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
 
 ## 메시지 서식
 
-- 이모지는 🧩(PR) ✅(배포 성공 · 리뷰 승인) ❌(배포 실패) 🔴(리뷰 변경 요청) 머리말과 PR 「리뷰」 줄의 🔴(필요) 🟢(불필요) 🟡(미정) ⚪(미기재)만 쓴다.
+- 이모지는 🧩(PR) ✅(배포 성공 · 리뷰 승인) ❌(배포 실패) 🔴(리뷰 변경 요청) 💬(리뷰 코멘트) 머리말과 PR 「리뷰」 줄의 🔴(필요) 🟢(불필요) 🟡(미정) ⚪(미기재)만 쓴다.
 - 첫 줄은 굵은 머리말이고 그 바로 아래가 **핵심 묶음**이다(PR 은 핵심 묶음 안을 빈 줄로 리뷰 / 레포·프로젝트·PR / 제목 / 작성자·브랜치·링크로 나눈다). 부가 정보는 빈 줄 뒤 **굵은 소제목**으로 묶는다.
 - 소제목 줄을 뺀 모든 줄은 `항목: 값` 이다(PR 「PR」 번호 줄은 줄 전체를 굵게 하고, 「리뷰」 줄은 값별 이모지를 앞에 붙이고 줄 전체를 굵게 한다). 값이 없는 항목은 줄째, 항목이 하나도 없는 묶음은 소제목째 빠진다. 리뷰 알림만 예외다(아래).
 - `parse_mode=HTML` 로 보내고 모든 값은 HTML 이스케이프한다. 링크 미리보기는 끈다.
@@ -54,7 +54,7 @@ PR: #123                         (굵게)
 PR 리뷰가 제출될 때마다(리뷰어별·회차별) 한 건씩 보낸다. 다른 알림과 달리 `항목: 값` 줄이 없다 — 머리말 아래는 「리뷰어 → 리뷰이」 줄과 링크 줄뿐이다.
 
 ```
-✅ #412 리뷰 승인                 ← 🔴 #412 리뷰 변경 요청
+✅ #412 리뷰 승인                 ← 🔴 #412 리뷰 변경 요청 / 💬 #412 리뷰 코멘트
 alice → mandykr                  (리뷰어 → PR 작성자)
 
 https://github.com/KPNP-R-D/KPNP-Web/pull/412#pullrequestreview-123456   (그 리뷰로 바로 가는 주소)
@@ -89,7 +89,7 @@ https://github.com/KPNP-R-D/KPNP-Web/pull/412#pullrequestreview-123456   (그 �
 | event_kind | 호출 이벤트 | 보냄 | 보내지 않음 (job 은 성공) |
 |---|---|---|---|
 | `pr` | `pull_request` · `pull_request_target` | `opened` · `reopened` · `ready_for_review` | Draft PR, 그 밖의 action(`synchronize` 등), `pull_request` 이벤트의 Dependabot·fork PR (Secret 이 넘어오지 않는다) |
-| `review` | `pull_request_review` | `submitted` 이고 state 가 `approved` · `changes_requested` | `commented`(인라인 코멘트 답글도 이것이 된다), `submitted` 가 아닌 action, fork PR |
+| `review` | `pull_request_review` | `submitted` 이고 state 가 `approved` · `changes_requested` · 본문 있는 `commented` | 본문 없는 `commented`(인라인 코멘트 답글이 이것이 된다), `submitted` 가 아닌 action, fork PR |
 | `deploy` | 아무 이벤트 | `result` = `success` · `failure` | `result` = `cancelled` · `skipped` |
 
 실패로 끝나는 경우 — 잘못 호출했거나 설정이 빠졌다는 뜻이다.
@@ -171,13 +171,15 @@ on:
 
 jobs:
   notify:
-    # 보내지 않을 리뷰(commented 등)는 러너를 띄우기 전에 거른다 — 모듈도 같은 조건으로 한 번 더 거른다
-    if: github.event.review.state == 'approved' || github.event.review.state == 'changes_requested'
+    # 보내지 않을 리뷰는 러너를 띄우기 전에 거른다 — 모듈도 같은 조건으로 한 번 더 거른다
+    if: github.event.review.state != 'dismissed' && (github.event.review.state != 'commented' || github.event.review.body != '')
     uses: KPNP-R-D/github-actions-module/.github/workflows/notify-telegram.yml@v2
     with:
       event_kind: review
     secrets: inherit
 ```
+
+이 파일이 들어가기 전에 열린 PR 은 PR 브랜치에 새로 push 해야 알림이 간다 — 리뷰 이벤트가 쓰는 테스트 머지 ref(`refs/pull/N/merge`)는 base 갱신만으로 다시 만들어지지 않는다(2026-11-12 KPNP-Web PR #504 실측: base 반영 후 리뷰에 실행 0건 · ref 생성 시각이 반영 전).
 
 ### 배포 알림 — 배포 워크플로우의 마지막 job
 

@@ -21,7 +21,7 @@
 
 * **Reusable Notify**
 
-  * v2: PR·리뷰·배포 알림을 전 레포 공통 서식(HTML · 🧩✅❌🔴)으로 텔레그램에 전송 — [docs/workflows/notify-telegram.md](docs/workflows/notify-telegram.md)
+  * v2: PR·리뷰·배포 알림을 전 레포 공통 서식(HTML · 🧩✅❌🔴💬)으로 텔레그램에 전송 — [docs/workflows/notify-telegram.md](docs/workflows/notify-telegram.md)
 
 ### Release Automation
 

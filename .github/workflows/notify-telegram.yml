@@ -156,8 +156,13 @@ jobs:
               case "$STATE" in
                 approved)          HEADER="✅ #$(ev '.pull_request.number') 리뷰 승인" ;;
                 changes_requested) HEADER="🔴 #$(ev '.pull_request.number') 리뷰 변경 요청" ;;
+                commented)         HEADER="💬 #$(ev '.pull_request.number') 리뷰 코멘트" ;;
                 *) skip "리뷰 state=$STATE 는 알림 대상이 아니다" ;;
               esac
+              # 인라인 코멘트에 답글만 달아도 본문 없는 commented 리뷰가 생긴다
+              if [[ "$STATE" == "commented" && -z "$(jq -r '(.review.body // "") | gsub("^\\s+|\\s+$"; "")' "$EV")" ]]; then
+                skip "본문 없는 코멘트 리뷰"
+              fi
               # pull_request_review 이벤트도 fork PR 에는 Secret 을 넘기지 않는다
               HEAD_REPO="$(ev '.pull_request.head.repo.full_name')"
               if [[ -n "$HEAD_REPO" && "$HEAD_REPO" != "$REPO" ]]; then skip "fork PR ($HEAD_REPO)"; fi
